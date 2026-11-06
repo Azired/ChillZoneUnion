@@ -1,6 +1,6 @@
 local _, U = ...
 ChillZoneUnion = U
-U.VERSION, U.PREFIX = "0.7.0-beta", "CZUnion3"
+U.VERSION, U.PREFIX = "0.7.1-beta", "CZUnion3"
 U.GUILDS = { "Чиллзон", "Чиллзон Навсегда" }
 U.GUILD_LEADERS = { [1] = "Вован Дубан" }
 U.UNION_LEADER = "Вован Дубан"
@@ -72,6 +72,11 @@ function U.ChatStatus(id, status)
     if U.RefreshChat then U.RefreshChat() end
     return true
 end
+local function InsertChat(entry)
+    local h, index = U.history, #U.history + 1
+    for i = #h, 1, -1 do if h[i].time <= entry.time then break else index = i end end
+    table.insert(h, index, entry)
+end
 function U.Chat(guild, name, text, native, metadata)
     metadata = type(metadata) == "table" and metadata or {}
     local id = U.Text(metadata.id, 220) and metadata.id ~= "" and metadata.id or nil
@@ -83,11 +88,31 @@ function U.Chat(guild, name, text, native, metadata)
     end
     local at = metadata.at
     if not U.Public(at) or type(at) ~= "number" or at < 0 or at > U.stamp() + 60 then at = U.stamp() end
+    local observed, relayed = metadata.observed == true, metadata.nativeRelay == true and id ~= nil
+    if native == true and guild == U.guild and (observed or relayed) then
+        -- Pair the native event and its authenticated gateway copy one-to-one.
+        -- Equal messages remain separate; duplicate wire IDs were handled above.
+        for i, row in ipairs(U.history) do
+            if row.native and row.guild == guild and row.name == name and row.text == text
+                and math.abs(row.time - at) <= 5
+                and ((observed and row.nativeRelayed and not row.nativeObserved)
+                    or (relayed and row.nativeObserved and not row.nativeRelayed)) then
+                if observed then row.nativeObserved = true; return false, row end
+                local moved = row.time ~= at
+                row.nativeRelayed, row.id, row.time = true, id, at
+                row.status, row.replayed = metadata.status or "delivered", metadata.replayed == true
+                U.chatByID[id], U.chatSeen[id] = row, U.clock()
+                if moved then table.remove(U.history, i); InsertChat(row) end
+                if U.RefreshChat then U.RefreshChat() end
+                return false, row
+            end
+        end
+    end
     local entry = { time = at, guild = guild, name = name, text = text, id = id,
-        status = metadata.status or "delivered", native = native == true, replayed = metadata.replayed == true }
-    local h, index = U.history, #U.history + 1
-    for i = #h, 1, -1 do if h[i].time <= at then break else index = i end end
-    table.insert(h, index, entry)
+        status = metadata.status or "delivered", native = native == true, replayed = metadata.replayed == true,
+        nativeObserved = observed, nativeRelayed = relayed }
+    InsertChat(entry)
+    local h = U.history
     if id then U.chatByID[id], U.chatSeen[id] = entry, U.clock() end
     if #h > 200 then
         local removed = table.remove(h, 1)

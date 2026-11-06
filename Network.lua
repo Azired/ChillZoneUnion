@@ -471,7 +471,7 @@ local function Status(id, state, announce)
         U.Queue("STATE", { id, state }, "GUILD", nil, true, false, nil, true, U.clock() + OUTBOX_FOR)
     end
 end
-local function ShowRecord(f, native, state, replayed)
+local function ShowRecord(f, native, state, replayed, nativeRelay)
     local id, at = f[4], tonumber(f[5])
     local previous = chatSeen[id]
     if previous and previous.state ~= "pending" and state == "pending" then state = previous.state end
@@ -479,7 +479,8 @@ local function ShowRecord(f, native, state, replayed)
     if state == "pending" then
         localPending[id] = U.clock() + math.max(0, OUTBOX_FOR - (U.stamp() - at))
     else localPending[id] = nil end
-    U.Chat(tonumber(f[1]), U.Name(f[2]), f[3], native, { id = id, at = at, status = state, replayed = replayed == true })
+    U.Chat(tonumber(f[1]), U.Name(f[2]), f[3], native, { id = id, at = at, status = state,
+        replayed = replayed == true, nativeRelay = nativeRelay == true })
 end
 local function Recent()
     if U.ChatRecent then return U.ChatRecent(HISTORY_LIMIT, U.stamp() - HISTORY_FOR) end
@@ -644,7 +645,7 @@ function U.HandleOwn(kind, f, sender, mine)
         if kind == "CHAT" and U.Name(f[2]) ~= sender then return false end
         if kind == "NATIVE" and (sender ~= U.GatewayName() or not U.own[U.Name(f[2])]) then return false end
         local forwarding = kind ~= "NATIVE" or U.db.bridgeGuildChat
-        ShowRecord(f, kind == "NATIVE", forwarding and "pending" or "local-only", false)
+        ShowRecord(f, kind == "NATIVE", forwarding and "pending" or "local-only", false, kind == "NATIVE")
         if U.IsGateway() then
             if forwarding then QueueCross(f) else Status(f[4], "local-only", true) end
         end
@@ -900,12 +901,16 @@ function U.NetworkTick()
     end
 end
 U.On("CHAT_MSG_GUILD", function(text, sender)
-    if not U.guild or not U.IsGateway() or U.clock() < nativeReadyAt then return end
+    if not U.guild then return end
     if not U.Text(text, 1200) or not U.Public(sender) then
-        if U.clock() - nativeHint > 120 then nativeHint = U.clock(); U.Print("Forever скрыл содержимое /г от аддонов. Для общего чата используйте /czu.") end
+        if U.IsGateway() and U.clock() - nativeHint > 120 then nativeHint = U.clock(); U.Print("Forever скрыл содержимое /г от аддонов. Для общего чата используйте /czu.") end
         return
     end
     sender = U.Name(sender)
     if not sender or not U.own[sender] then return end
+    -- Local viewing does not require another installed client or relay rights.
+    -- ID-less observations cannot be exported by the history/catchup protocol.
+    U.Chat(U.guild, sender, text, true, { at = U.stamp(), status = "local-only", observed = true })
+    if not U.IsGateway() or U.clock() < nativeReadyAt then return end
     U.Emit("NATIVE", { U.guild, sender, text, StableID(), U.stamp() }, true)
 end)

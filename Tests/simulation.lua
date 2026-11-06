@@ -655,6 +655,139 @@ local function FindText(c, needle)
     for _, h in ipairs(c.U.history) do if h.text == needle then n = n + 1 end end
     return n
 end
+-- Native guild chat remains visible with one ordinary addon installation.
+do
+    clients, wire, deliveryFilter = {}, {}, nil
+    time = time + 100
+    local member = NewClient("Solo Regular", 1, 2)
+    SetRosters(0)
+    member.rows[#member.rows + 1] = { name = "Native Friend", rank = 2, online = true, level = 35 }
+    expect(member.U.ReadRoster(), "solo native-chat roster was not ready")
+    member.U.frame.scripts.OnEvent(member.U.frame, "PLAYER_LOGIN")
+    expect(not member.U.IsGateway() and not member.U.Connected(), "solo regular client unexpectedly had a relay")
+    member.U.OpenRoster()
+    local chatTab, chatLog = member.E.ChillZoneUnionWindowTab2
+    chatTab.scripts.OnClick(chatTab)
+    for _, frame in ipairs(member.allFrames) do if frame.frameType == "ScrollingMessageFrame" then chatLog = frame end end
+    expect(chatLog, "native-chat pane was not created")
+    -- Roster readiness starts the gateway's transmission grace period. It must
+    -- never suppress the local mirror, including the player's own native line.
+    member.U.OnRosterReady()
+    local queued, main, native = member.U.QueueSize(), #member.log, #(member.chatFrames[2].messages or {})
+    for _, source in ipairs({ member.name, "Native Friend" }) do
+        member.U.frame.scripts.OnEvent(member.U.frame, "CHAT_MSG_GUILD", "solo /g from " .. source, source .. "-ForeverRealm")
+    end
+    eq(#member.U.history, 2, "unpaired regular client missed native guild messages")
+    eq(#chatLog.messages, 2, "selected addon chat pane did not refresh immediately")
+    for _, row in ipairs(member.U.history) do
+        expect(row.native and not row.id, "local native observation acquired a relay identity")
+        eq(row.status, "local-only", "local native observation claimed delivery")
+        eq(row.guild, 1, "native observation used the wrong guild")
+    end
+    eq(member.U.history[2].name, "Native Friend", "non-addon native author changed")
+    eq(#member.U.ChatRecent(), 0, "unconfirmed native observations entered exported history")
+    eq(member.U.QueueSize(), queued, "ordinary native observations queued addon traffic")
+    eq(member.U.ChatOutboxCount(), 0, "ordinary native observations entered the cross-guild outbox")
+    eq(#member.log, main, "native observations printed a second line in the default chat frame")
+    eq(#(member.chatFrames[2].messages or {}), native, "native observations printed a second line in a guild chat tab")
+    member.U.frame.scripts.OnEvent(member.U.frame, "CHAT_MSG_GUILD", { secret = true }, "Native Friend-ForeverRealm")
+    member.U.frame.scripts.OnEvent(member.U.frame, "CHAT_MSG_GUILD", "secret author", { secret = true })
+    member.U.frame.scripts.OnEvent(member.U.frame, "CHAT_MSG_GUILD", "unknown author", "Unknown Outsider-ForeverRealm")
+    eq(#member.U.history, 2, "secret or unknown native data entered local history")
+    eq(member.U.QueueSize(), queued, "invalid native observations queued addon traffic")
+end
+print("PASS solo regular native guild-chat mirror, immediate pane refresh and local-only privacy")
+
+do
+    local gm, officer = LinkedPair()
+    local member = NewClient("Native Observer", 1, 2)
+    SetRosters(0)
+    member.U.frame.scripts.OnEvent(member.U.frame, "PLAYER_LOGIN")
+    Step(35)
+    expect(member.U.Connected() and member.U.GatewayName() == gm.name, "native reconciliation fixture was not connected")
+    member.U.OpenRoster()
+    local chatTab = member.E.ChillZoneUnionWindowTab2
+    local function Unread() return tonumber(chatTab:GetText():match("%((%d+)%)$")) or 0 end
+    local function Native(text, source)
+        member.U.frame.scripts.OnEvent(member.U.frame, "CHAT_MSG_GUILD", text, (source or gm.name) .. "-ForeverRealm")
+    end
+    local function Record(suffix, text, source, at)
+        return { 1, source or gm.name, text, "1:" .. gm.name .. ":" .. suffix, at or member.U.stamp() }
+    end
+    local function Relay(fields)
+        expect(member.U.HandleOwn("NATIVE", fields, gm.name), "authenticated native relay was rejected")
+    end
+
+    Native("native-first promotion")
+    local provisional, unread = member.U.history[#member.U.history], Unread()
+    expect(not provisional.id and unread > 0, "native observation was not provisional and unread")
+    local first = Record("first", provisional.text, nil, member.U.stamp() - 1)
+    local count, main = #member.U.history, #member.log
+    Relay(first)
+    eq(#member.U.history, count, "native-first relay duplicated the local observation")
+    eq(member.U.chatByID[first[4]], provisional, "native relay replaced the local row instead of adopting it")
+    eq(provisional.id, first[4], "native relay ID was not adopted")
+    eq(provisional.time, first[5], "native relay timestamp was not adopted")
+    eq(provisional.status, "pending", "native relay delivery state was not adopted")
+    eq(Unread(), unread, "native row promotion counted a second unread message")
+    member.U.HandleOwn("STATE", { first[4], "delivered" }, gm.name)
+    Relay(first)
+    eq(provisional.status, "delivered", "repeated native relay downgraded acknowledged delivery")
+    eq(#member.U.history, count, "repeated canonical native packet duplicated history")
+    eq(Unread(), unread, "repeated canonical native packet incremented unread")
+    eq(#member.log, main, "native relay promotion printed native chat again")
+
+    Native("native-first repeated text"); Native("native-first repeated text")
+    local left, right = member.U.history[#member.U.history - 1], member.U.history[#member.U.history]
+    local leftPacket, rightPacket = Record("repeat-left", left.text), Record("repeat-right", right.text)
+    Relay(leftPacket); Relay(leftPacket)
+    eq(left.id, leftPacket[4], "first repeated native row was not matched FIFO")
+    expect(not right.id, "duplicate canonical packet consumed another identical native observation")
+    Relay(rightPacket)
+    eq(right.id, rightPacket[4], "second repeated native row was not matched FIFO")
+    eq(FindText(member, left.text), 2, "native-first repeated texts did not remain one-to-one")
+
+    local packetLeft, packetRight = Record("packet-left", "packet-first repeated text"), Record("packet-right", "packet-first repeated text")
+    Relay(packetLeft); Relay(packetRight); Relay(packetLeft)
+    local canonicalLeft, canonicalRight = member.U.chatByID[packetLeft[4]], member.U.chatByID[packetRight[4]]
+    local packetUnread = Unread()
+    Native(packetLeft[3]); Native(packetLeft[3])
+    eq(FindText(member, packetLeft[3]), 2, "packet-first native events duplicated relay rows")
+    eq(member.U.chatByID[packetLeft[4]], canonicalLeft, "packet-first reconciliation replaced the first row")
+    eq(member.U.chatByID[packetRight[4]], canonicalRight, "packet-first reconciliation replaced the second row")
+    eq(Unread(), packetUnread, "packet-first reconciliation added unread messages")
+    Native(packetLeft[3])
+    eq(FindText(member, packetLeft[3]), 3, "two canonical rows swallowed a third legitimate identical native event")
+    expect(not member.U.history[#member.U.history].id, "third native event reused an already matched canonical row")
+
+    Native("native sender isolation", gm.name)
+    Relay(Record("other-author", "native sender isolation", member.name))
+    eq(FindText(member, "native sender isolation"), 2, "different native authors were reconciled")
+    Relay(Record("expired", "native pairing window", nil, member.U.stamp() - 6))
+    Native("native pairing window")
+    eq(FindText(member, "native pairing window"), 2, "native reconciliation crossed its five-second timestamp window")
+
+    -- HREC carries both native and /czu history. It is not evidence that a
+    -- subsequently observed native event is the same logical message.
+    local replay = Record("history-only", "ambiguous native history")
+    member.U.HandleOwn("HREC", replay, gm.name)
+    Native(replay[3])
+    eq(FindText(member, replay[3]), 2, "history replay was incorrectly consumed as a native relay")
+    local localAfterReplay = member.U.history[#member.U.history]
+    expect(not localAfterReplay.id, "native event adopted an ambiguous HREC identity")
+    Relay(replay)
+    expect(not localAfterReplay.id, "repeated canonical ID consumed a fresh native observation after HREC")
+    eq(FindText(member, replay[3]), 2, "NATIVE duplicate after HREC changed logical message count")
+
+    local realText = "native transport reconciliation"
+    Native(realText)
+    gm.U.frame.scripts.OnEvent(gm.U.frame, "CHAT_MSG_GUILD", realText, gm.name .. "-ForeverRealm")
+    Step(6, true)
+    eq(FindText(member, realText), 1, "native event plus duplicate addon transport duplicated the connected member's pane")
+    eq(FindText(officer, realText), 1, "native relay did not reach the other guild exactly once")
+end
+print("PASS native relay adoption, both arrival orders, FIFO repetitions, unread stability and HREC isolation")
+
 local function Kind(p)
     local _, part, count, encoded = p.text:match("^([^~]+)~(%d+)~(%d+)~(.*)$")
     if tonumber(part) ~= 1 or tonumber(count) ~= 1 then return nil end

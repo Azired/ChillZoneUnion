@@ -628,7 +628,8 @@ function U.RefreshChat()
     local reading = ReadingChat()
     local nextSeen, lines, keys, added = {}, {}, {}, 0
     for i, h in ipairs(U.history) do
-        local key = h.id or h
+        -- A native observation keeps its identity when the gateway supplies its ID.
+        local key = h
         nextSeen[key], keys[i] = true, key
         if not seenHistory[key] then
             added = added + 1
