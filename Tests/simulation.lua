@@ -46,6 +46,7 @@ local function UIObject()
     end
     function methods:Enable() self.enabled = true end
     function methods:Disable() self.enabled = false end
+    function methods:IsEnabled() return self.enabled ~= false end
     function methods:SetFocus() self.focus = true end
     function methods:ClearFocus() self.focus = false end
     function methods:HasFocus() return self.focus == true end
@@ -121,7 +122,30 @@ local function NewClient(name, guild, rank, savedDB)
         local f = UIObject(); c.allFrames[#c.allFrames + 1] = f
         f.frameType, f.parent, f.template = kind, parent, template
         if frameName then E[frameName] = f end
+        if template == "ButtonFrameTemplate" or template == "PortraitFrameTemplate" or template == "BasicFrameTemplateWithInset" then
+            -- XML templates create real child regions, not the mock's optional
+            -- uppercase-method fallback. The inherited close button owns its
+            -- normal parent-hide behavior before addon handlers run.
+            f.TitleText, f.Bg = f:CreateFontString(), f:CreateTexture()
+            f.TitleContainer = UIObject(); f.TitleContainer.parent = f; f.TitleContainer.TitleText = f.TitleText
+            f.portrait = f:CreateTexture()
+            f.PortraitContainer = UIObject(); f.PortraitContainer.parent = f; f.PortraitContainer.portrait = f.portrait
+            f.Inset = E.CreateFrame("Frame", nil, f, "InsetFrameTemplate")
+            f.CloseButton = E.CreateFrame("Button", nil, f, "UIPanelCloseButton")
+            f.CloseButton:SetScript("OnClick", function() f:Hide() end)
+        end
         return f
+    end
+    E.PanelTemplates_TabResize = function(tab, padding)
+        assert(type(tab) == "table" and type(padding) == "number", "native tab resize requires a tab and padding")
+    end
+    E.PanelTemplates_SelectTab = function(tab)
+        assert(type(tab) == "table", "native tab selection requires a tab")
+        tab.nativeTabSelected = true; tab:Disable()
+    end
+    E.PanelTemplates_DeselectTab = function(tab)
+        assert(type(tab) == "table", "native tab deselection requires a tab")
+        tab.nativeTabSelected = false; tab:Enable()
     end
     E.UIParent, E.Minimap, E.GameTooltip = UIObject(), UIObject(), UIObject()
     local tooltipSetText = E.GameTooltip.SetText
@@ -404,16 +428,62 @@ for _, c in ipairs(clients) do
         local title = f.text:match("^Общий чат") or f.text
         if f.parent == window and (title == "Переходы" or title == "Связь" or title == "Общий чат" or title == "Состав") then
             expect(type(f.scripts.OnClick) == "function", "tab has no click handler: " .. f.text)
-            foundTabs[title] = true; f.scripts.OnClick(f)
+            foundTabs[title] = f; f.scripts.OnClick(f)
         end
         if f.parent == window and f.template == "UIPanelCloseButton" then close = f end
     end
     for _, title in ipairs({ "Состав", "Общий чат", "Переходы", "Связь" }) do expect(foundTabs[title], "missing tab: " .. title) end
+    for _, tab in pairs(foundTabs) do
+        tab.scripts.OnClick(tab)
+        for _, candidate in pairs(foundTabs) do
+            eq(candidate.nativeTabSelected, candidate == tab, "native tab selection does not follow the visible page")
+        end
+    end
     expect(close and type(close.scripts.OnClick) == "function", "window close button missing")
     close.scripts.OnClick(close); expect(not window:IsShown(), "window close button did not close the panel")
     c.U.Toggle(); expect(window:IsShown(), "window could not reopen after close")
 end
 print("PASS UI construction and tabs")
+do
+    local c, fields = a2, {}
+    for _, frame in ipairs(c.allFrames) do
+        if frame.frameType == "EditBox" then fields[frame.width] = frame end
+    end
+    local search, chat, contact, announcement = fields[280], fields[780], fields[350], fields[328]
+    expect(search and chat and contact and announcement, "page inputs missing from focus regression")
+    c.U.OpenRoster(); search:SetText("draft filter"); search:SetFocus()
+    c.U.OpenChat(); expect(not search:HasFocus(), "roster input kept keyboard focus after switching to chat")
+    chat:SetFocus(); c.U.OpenSettings()
+    expect(not chat:HasFocus(), "chat input kept keyboard focus after switching to settings")
+    contact:SetFocus(); c.U.OpenRoster()
+    expect(not contact:HasFocus(), "contact input kept keyboard focus after leaving settings")
+    local rosterTab
+    for _, frame in ipairs(c.allFrames) do
+        if frame.parent == c.E.ChillZoneUnionWindow and frame.nativeTabSelected then rosterTab = frame end
+    end
+    expect(rosterTab, "roster page has no selected native tab")
+    c.U.OpenSettings(); announcement:SetFocus(); c.U.OpenClassStats()
+    expect(not announcement:HasFocus(), "announcement input kept keyboard focus on class statistics")
+    local selectedTabs = 0
+    for _, frame in ipairs(c.allFrames) do
+        if frame.parent == c.E.ChillZoneUnionWindow and frame.nativeTabSelected then selectedTabs = selectedTabs + 1 end
+    end
+    eq(selectedTabs, 1, "class statistics lost its parent tab selection")
+    expect(rosterTab.nativeTabSelected, "class statistics did not retain the roster parent tab")
+    c.U.OpenRoster(); search:SetFocus(); search.scripts.OnEscapePressed(search)
+    expect(not search:HasFocus() and c.E.ChillZoneUnionWindow:IsShown(), "input Escape did not release focus while retaining the window")
+    eq(search:GetText(), "draft filter", "tab navigation or input Escape discarded the roster search")
+    search:SetFocus()
+    local escaped
+    for _, name in ipairs(c.E.UISpecialFrames) do
+        if c.E[name] == c.E.ChillZoneUnionWindow then escaped = c.E[name]; break end
+    end
+    expect(escaped, "window is not registered for native Escape dismissal")
+    escaped:Hide()
+    expect(not search:HasFocus(), "native window dismissal kept keyboard focus")
+    c.U.OpenRoster(); search:SetText(""); search.scripts.OnTextChanged(search, true)
+end
+print("PASS page focus cleanup, input Escape and native window dismissal")
 do
     local input
     for _, f in ipairs(a2.allFrames) do if f.frameType == "EditBox" and f.width == 780 then input = f end end

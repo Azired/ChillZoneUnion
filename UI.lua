@@ -36,6 +36,68 @@ local function Edit(parent, x, y, width, hint)
     if hint then Label(parent, hint, x, y + 23, width, "GameFontNormalSmall") end
     return b
 end
+local Native = {}
+function Native.HasMethod(object, method)
+    local kind = type(object)
+    return (kind == "table" or kind == "userdata") and type(object[method]) == "function"
+end
+-- Let the client supply its own frame art: Forever replaces these templates with
+-- its bronze frame layout, while other compatible clients keep their own skin.
+function Native.Frame(kind, name, parent, templates)
+    for index, template in ipairs(templates) do
+        local frameName = name and (index == 1 and name or name .. "Fallback" .. index) or nil
+        local ok, frame = pcall(CreateFrame, kind, frameName, parent, template)
+        if ok and frame then return frame, template end
+    end
+end
+function Native.Inset(parent, x, y, width, height)
+    local frame = Native.Frame("Frame", nil, parent, { "InsetFrameTemplate" })
+    if not frame then
+        frame = CreateFrame("Frame", nil, parent, "BackdropTemplate")
+        frame:SetBackdrop({ bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", tile = true, tileSize = 16, edgeSize = 12,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 } })
+    end
+    frame:SetFrameLevel(math.max(0, parent:GetFrameLevel() - 1))
+    frame:EnableMouse(false)
+    frame:SetPoint("TOPLEFT", x, y); frame:SetSize(width, height)
+    return frame
+end
+function Native.RowArt(button, index)
+    local stripe = button:CreateTexture(nil, "BACKGROUND")
+    stripe:SetAllPoints(); stripe:SetTexture("Interface\\GuildFrame\\GuildFrame")
+    stripe:SetTexCoord(0.36230469, 0.38183594, 0.95898438, 0.99804688)
+    stripe:SetAlpha(index % 2 == 0 and 0.16 or 0.04)
+    button.bg = button:CreateTexture(nil, "ARTWORK"); button.bg:SetAllPoints()
+    button.bg:SetColorTexture(0.12, 0.32, 0.62, 0)
+    button:SetHighlightTexture("Interface\\FriendsFrame\\UI-FriendsFrame-HighlightBar", "ADD")
+    local highlight = button:GetHighlightTexture()
+    if Native.HasMethod(highlight, "SetVertexColor") then highlight:SetVertexColor(0.3, 0.5, 1, 0.3) end
+end
+function Native.ClearPageFocus()
+    for _, edit in pairs({ search = search, chat = chatBox, contact = contact, announcement = announcementEdit }) do
+        if edit:HasFocus() then edit:ClearFocus() end
+    end
+end
+function Native.ResizeTab(tab)
+    if tab and tab.czuNative and type(PanelTemplates_TabResize) == "function" then
+        pcall(PanelTemplates_TabResize, tab, 12)
+    end
+end
+function Native.RefreshTabs()
+    local current = page == "stats" and "roster" or page
+    for key, tab in pairs(tabs) do
+        local active = key == current
+        tab.czuSelected = active
+        local style = active and PanelTemplates_SelectTab or PanelTemplates_DeselectTab
+        if tab.czuNative and type(style) == "function" then
+            pcall(style, tab)
+        else
+            if active then tab:Disable() else tab:Enable() end
+        end
+        Native.ResizeTab(tab)
+    end
+end
 local function Enable(button, on) if on then button:Enable() else button:Disable() end end
 local function Age(at)
     if not at then return "нет данных" end
@@ -123,6 +185,7 @@ local function ReadingChat()
 end
 local function UpdateUnread()
     if tabs.chat then tabs.chat:SetText(unread > 0 and ("Общий чат (" .. (unread > 99 and "99+" or unread) .. ")") or "Общий чат") end
+    Native.ResizeTab(tabs.chat)
     if chatJump then
         chatJump:SetText((unread > 0 and ("К новым (" .. unread .. ") ") or "В конец ") .. ArrowText("down"))
         chatJump:SetShown(unread > 0 or not AtBottom())
@@ -134,8 +197,10 @@ local function MarkRead()
 end
 local function Switch(which)
     U.CloseRosterContextMenu()
+    Native.ClearPageFocus()
     page = which
     for name, p in pairs(pages) do p:SetShown(name == which) end
+    Native.RefreshTabs()
     U.Refresh()
     if which == "chat" then U.RefreshChat(); MarkRead() end
 end
@@ -208,9 +273,9 @@ local function FallbackContextMenu(context, entries)
     if not rosterContextFallback then
         local popup = CreateFrame("Frame", "ChillZoneUnionRosterMenu", UIParent, "BackdropTemplate")
         popup:SetFrameStrata("TOOLTIP"); popup:SetClampedToScreen(true); popup:EnableMouse(true)
-        popup:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12,
+        popup:SetBackdrop({ bgFile = "Interface\\Tooltips\\UI-Tooltip-Background", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12,
             insets = { left = 3, right = 3, top = 3, bottom = 3 } })
-        popup:SetBackdropColor(0.045, 0.065, 0.085, 0.98)
+        popup:SetBackdropColor(0.08, 0.08, 0.08, 1)
         popup.title = Label(popup, "", 12, -12, 276, "GameFontNormal")
         popup.guild = Label(popup, "", 12, -33, 276, "GameFontHighlightSmall")
         popup.buttons = {}
@@ -362,7 +427,7 @@ RenderRoster = function()
             b.level:SetText(tostring(row.level))
             b.zone:SetText(fresh[row.guild] and U.SafeDisplay(row.online and row.zone or "Не в сети") or "Нет свежих данных")
             b.rank:SetText(U.SafeDisplay(row.rankName))
-            b.bg:SetColorTexture(0.18, 0.51, 0.46, selected and selected.name == row.name and selected.guild == row.guild and 0.45 or (i % 2 == 0 and 0.10 or 0.02))
+            b.bg:SetColorTexture(0.12, 0.32, 0.62, selected and selected.name == row.name and selected.guild == row.guild and 0.45 or 0)
             if b.czuHovered then hovered = b end
         else
             b.addonBadge:Hide()
@@ -397,7 +462,10 @@ RenderTickets = function()
     ticketOffset = math.max(0, math.min(ticketOffset, math.max(0, #all - #ticketRows)))
     for i, b in ipairs(ticketRows) do
         local t = all[ticketOffset + i]; b.ticket = t; b:SetShown(t ~= nil)
-        if t then b:SetText(U.SafeDisplay(t.member) .. " " .. ArrowText("right", 10) .. " " .. U.GUILDS[t.dest] .. "   •   " .. (states[t.state] or t.state)) end
+        if t then
+            b:SetText(U.SafeDisplay(t.member) .. " " .. ArrowText("right", 10) .. " " .. U.GUILDS[t.dest] .. "   •   " .. (states[t.state] or t.state))
+            b.bg:SetColorTexture(0.12, 0.32, 0.62, t.id == selectedTicket and 0.45 or 0)
+        end
     end
     pages.transfers.range:SetText((#all > 0 and ticketOffset + 1 or 0) .. "–" .. math.min(ticketOffset + #ticketRows, #all) .. " из " .. #all)
     local t = selectedTicket and U.Tickets()[selectedTicket]
@@ -441,6 +509,7 @@ RenderClassStats = function()
     end
 end
 local function BuildClassStats(stats)
+    Native.Inset(stats, -8, -79, 966, 349)
     Button(stats, "К списку", 0, 0, 130, function() Switch("roster") end)
     Label(stats, "Статистика по классам", 155, -4, 620, "GameFontNormalLarge")
     Button(stats, "Обновить", 820, 0, 130, function() U.RequestRoster(); U.snapshotDue = 0; RenderClassStats() end)
@@ -456,7 +525,9 @@ local function BuildClassStats(stats)
         local frame = CreateFrame("Frame", nil, stats)
         frame:SetSize(950, 22); frame:SetPoint("TOPLEFT", 0, -130 - (i - 1) * 22)
         local background = frame:CreateTexture(nil, "BACKGROUND"); background:SetAllPoints()
-        background:SetColorTexture(0.18, 0.51, 0.46, i % 2 == 0 and 0.10 or 0.02)
+        background:SetTexture("Interface\\GuildFrame\\GuildFrame")
+        background:SetTexCoord(0.36230469, 0.38183594, 0.95898438, 0.99804688)
+        background:SetAlpha(i % 2 == 0 and 0.16 or 0.04)
         frame.name = Label(frame, "", 5, -4, 220)
         frame.guild1 = Label(frame, "", 240, -4, 220)
         frame.guild2 = Label(frame, "", 485, -4, 240)
@@ -596,35 +667,81 @@ function U.Refresh()
 end
 
 Build = function()
-    window = CreateFrame("Frame", "ChillZoneUnionWindow", UIParent, "BackdropTemplate")
+    window = Native.Frame("Frame", "ChillZoneUnionWindow", UIParent,
+        { "ButtonFrameTemplate", "PortraitFrameTemplate", "BasicFrameTemplateWithInset" })
+    if not window then
+        window = CreateFrame("Frame", "ChillZoneUnionWindowFallback", UIParent, "BackdropTemplate")
+        window:SetBackdrop({ bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border", tile = true, tileSize = 32, edgeSize = 32,
+            insets = { left = 8, right = 8, top = 8, bottom = 8 } })
+    end
+    _G.ChillZoneUnionWindow = window
     window:SetSize(1000, 650); window:SetPoint("CENTER"); window:SetFrameStrata("DIALOG")
-    window:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", tile = false, edgeSize = 14, insets = { left = 4, right = 4, top = 4, bottom = 4 } })
-    window:SetBackdropColor(0.045, 0.065, 0.085, 0.98); window:SetBackdropBorderColor(0.25, 0.65, 0.58, 1)
+    window:SetToplevel(true); window:SetClampedToScreen(true)
+    if window.SetClampRectInsets then window:SetClampRectInsets(0, 0, 0, 30) end
     window:EnableMouse(true); window:SetMovable(true); window:RegisterForDrag("LeftButton")
     window:SetScript("OnDragStart", window.StartMoving); window:SetScript("OnDragStop", window.StopMovingOrSizing)
     table.insert(UISpecialFrames, "ChillZoneUnionWindow")
-    Label(window, "ЧИЛЛЗОН  |  СОЮЗ ГИЛЬДИЙ", 24, -22, 650, "GameFontNormalLarge")
-    Label(window, "Чиллзон  •  Чиллзон Навсегда", 25, -49, 650, "GameFontHighlightSmall")
+    local title = "Чиллзон — Союз гильдий"
+    if Native.HasMethod(window, "SetTitle") then window:SetTitle(title)
+    elseif Native.HasMethod(window.TitleText, "SetText") then window.TitleText:SetText(title)
+    elseif Native.HasMethod(window.TitleContainer, "GetObjectType") and Native.HasMethod(window.TitleContainer.TitleText, "SetText") then
+        window.TitleContainer.TitleText:SetText(title)
+    else Label(window, title, 80, -7, 780, "GameFontNormal") end
+    local portrait = window.portrait
+    if not Native.HasMethod(portrait, "SetTexture") then portrait = window.Portrait end
+    if not Native.HasMethod(portrait, "SetTexture") and Native.HasMethod(window.PortraitContainer, "GetObjectType") then
+        portrait = window.PortraitContainer.portrait
+    end
+    if Native.HasMethod(portrait, "SetTexture") then
+        portrait:SetTexture("Interface\\AddOns\\ChillZoneUnion\\Media\\minimap")
+        if type(SetPortraitToTexture) == "function" then
+            pcall(SetPortraitToTexture, portrait, "Interface\\AddOns\\ChillZoneUnion\\Media\\minimap")
+        end
+    end
+    if Native.HasMethod(window.Inset, "Hide") then window.Inset:Hide() end
+    local body = Native.Inset(window, 14, -66, 972, 540)
+    body:SetFrameLevel(window:GetFrameLevel() + 1)
+    window.czuBody = body
+    Label(window, "Чиллзон  /  Чиллзон Навсегда", 80, -40, 660, "GameFontHighlightSmall")
     local indicator = CreateFrame("Button", nil, window)
-    indicator:SetSize(190, 24); indicator:SetPoint("TOPLEFT", 769, -43)
+    indicator:SetSize(190, 24); indicator:SetPoint("TOPLEFT", 780, -34)
     indicator:SetScript("OnClick", function() Switch("link") end)
     headerDot = indicator:CreateTexture(nil, "OVERLAY"); headerDot:SetSize(7, 7); headerDot:SetPoint("LEFT", 7, 0)
     headerDot:SetTexture("Interface\\AddOns\\ChillZoneUnion\\Media\\status-dot")
     headerState = Label(indicator, "", 23, -6, 165, "GameFontHighlightSmall")
-    local close = CreateFrame("Button", nil, window, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -6, -5)
+    local close = window.CloseButton
+    if not Native.HasMethod(close, "SetScript") then
+        close = CreateFrame("Button", nil, window, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -6, -5)
+    end
     close:SetScript("OnClick", function() window:Hide() end)
     local definitions = { { "roster", "Состав", 110 }, { "chat", "Общий чат", 160 }, { "transfers", "Переходы", 125 }, { "link", "Связь", 110 } }
-    local x = 24
-    for _, tab in ipairs(definitions) do
+    local previous
+    for index, tab in ipairs(definitions) do
         local key = tab[1]
-        tabs[key] = Button(window, tab[2], x, -78, tab[3], function() Switch(key) end); x = x + tab[3] + 8
-        local p = CreateFrame("Frame", nil, window); p:SetPoint("TOPLEFT", 24, -122); p:SetPoint("BOTTOMRIGHT", -24, 54); p:Hide(); pages[key] = p
+        local button = Native.Frame("Button", "ChillZoneUnionWindowTab" .. index, window,
+            { "PanelTabButtonTemplate", "CharacterFrameTabButtonTemplate", "TabButtonTemplate" })
+        if button then
+            button.czuNative = true
+        else
+            button = CreateFrame("Button", nil, window, "UIPanelButtonTemplate")
+        end
+        button:SetID(index); button:SetSize(tab[3], 32); button:SetText(tab[2])
+        button:SetScript("OnClick", function() Switch(key) end)
+        if previous then
+            local modern = Native.HasMethod(button.LeftActive, "Show") and type(PanelTemplates_AnchorTabs) == "function"
+            button:SetPoint("TOPLEFT", previous, "TOPRIGHT", modern and 3 or -15, 0)
+        else button:SetPoint("TOPLEFT", window, "BOTTOMLEFT", 16, 2) end
+        tabs[key] = button; previous = button; Native.ResizeTab(button)
+        local p = CreateFrame("Frame", nil, window); p:SetPoint("TOPLEFT", 24, -86); p:SetPoint("BOTTOMRIGHT", -24, 54); p:Hide(); pages[key] = p
+        p:SetFrameLevel(body:GetFrameLevel() + 2)
     end
     local stats = CreateFrame("Frame", nil, window)
-    stats:SetPoint("TOPLEFT", 24, -122); stats:SetPoint("BOTTOMRIGHT", -24, 54); stats:Hide(); pages.stats = stats
+    stats:SetPoint("TOPLEFT", 24, -86); stats:SetPoint("BOTTOMRIGHT", -24, 54); stats:Hide(); pages.stats = stats
+    stats:SetFrameLevel(body:GetFrameLevel() + 2)
     status = Label(window, "", 25, -628, 950, "GameFontHighlightSmall")
     local r = pages.roster
-    counts = Label(r, "", 0, 0, 950, "GameFontNormal")
+    counts = Label(r, "", 0, 0, 950, "GameFontNormalLarge")
     guildCounts = Label(r, "", 0, -21, 950, "GameFontHighlightSmall")
     search = Edit(r, 7, -60, 280, "Поиск по имени, званию или локации")
     search:SetScript("OnTextChanged", function() U.CloseRosterContextMenu(); offset = 0; RenderRoster() end)
@@ -638,9 +755,14 @@ Build = function()
     offline:SetScript("OnClick", function() U.CloseRosterContextMenu(); offset = 0; RenderRoster() end)
     Button(r, "Обновить", 820, -61, 130, function() U.RequestRoster(); U.snapshotDue = 0 end)
     Button(r, "По классам", 715, -61, 95, function() U.OpenClassStats() end)
+    Native.Inset(r, -8, -94, 966, 320)
     local function SortHeader(key, title, x, width)
-        local b = CreateFrame("Button", nil, r)
+        local b = Native.Frame("Button", "ChillZoneUnionColumn" .. key, r,
+            { "WhoFrameColumnHeaderTemplate", "GuildFrameColumnHeaderTemplate" })
+            or CreateFrame("Button", nil, r)
         b:SetSize(width, 24); b:SetPoint("TOPLEFT", x, -100)
+        if type(WhoFrameColumn_SetWidth) == "function" then pcall(WhoFrameColumn_SetWidth, b, width) end
+        b:SetWidth(width)
         local label = Label(b, title, 0, -7, width - 15, "GameFontNormalSmall")
         b:SetFontString(label)
         b:SetText(title); b.sortTitle = title; sortHeaders[key] = b
@@ -664,7 +786,7 @@ Build = function()
     Label(r, "Гильдия", 775, -107, 170, "GameFontNormalSmall")
     for i = 1, 11 do
         local b = CreateFrame("Button", nil, r); b:SetSize(950, 24); b:SetPoint("TOPLEFT", 0, -128 - (i - 1) * 25)
-        b.bg = b:CreateTexture(nil, "BACKGROUND"); b.bg:SetAllPoints()
+        Native.RowArt(b, i)
         b.addonBadge = Label(b, "CZ", 5, -6, 20, "GameFontNormalSmall"); b.addonBadge:Hide()
         b.name = Label(b, "", 29, -5, 266); b.level = Label(b, "", 320, -5, 35)
         b.zone = Label(b, "", 365, -5, 225, "GameFontHighlightSmall"); b.rank = Label(b, "", 600, -5, 165, "GameFontHighlightSmall")
@@ -689,6 +811,8 @@ Build = function()
     BuildClassStats(stats)
 
     local c = pages.chat
+    Native.Inset(c, -8, 8, 966, 44)
+    Native.Inset(c, -8, -61, 966, 349)
     local banner = CreateFrame("Button", nil, c); banner:SetPoint("TOPLEFT", 0, 0); banner:SetSize(945, 36)
     announcementBanner = Label(banner, "", 0, 0, 945, "GameFontHighlightSmall"); announcementBanner:SetHeight(36); announcementBanner:SetJustifyV("TOP")
     banner:SetScript("OnEnter", function(self)
@@ -702,7 +826,7 @@ Build = function()
     banner:SetScript("OnLeave", function() GameTooltip:Hide() end)
     banner:SetScript("OnClick", function() GameTooltip:Hide(); Switch("link") end)
     Label(c, "Один чат для обеих гильдий. Нажмите имя для шёпота; ссылки на предметы работают как обычно.", 0, -43, 945, "GameFontNormalSmall")
-    chatLog = CreateFrame("ScrollingMessageFrame", nil, c); chatLog:SetPoint("TOPLEFT", 0, -65); chatLog:SetSize(945, 345)
+    chatLog = CreateFrame("ScrollingMessageFrame", nil, c); chatLog:SetPoint("TOPLEFT", 4, -69); chatLog:SetSize(935, 333)
     chatLog:SetFontObject(GameFontHighlight); chatLog:SetJustifyH("LEFT"); chatLog:SetFading(false); chatLog:SetMaxLines(200)
     chatLog:EnableMouseWheel(true); chatLog:SetScript("OnMouseWheel", function(self, d)
         if d > 0 then self:ScrollUp() else self:ScrollDown() end
@@ -723,9 +847,15 @@ Build = function()
     Label(c, "История сохраняется до перезагрузки интерфейса. Сообщения видны участникам обеих гильдий с аддоном.", 0, -483, 945, "GameFontHighlightSmall")
 
     local t = pages.transfers
+    Native.Inset(t, -8, -28, 606, 374)
     Label(t, "Переходы по согласию участника", 0, 0, 950, "GameFontNormal")
     for i = 1, 12 do
-        local b = Button(t, "", 0, -35 - (i - 1) * 30, 590, function(self)
+        local b = CreateFrame("Button", nil, t)
+        b:SetSize(590, 26); b:SetPoint("TOPLEFT", 0, -35 - (i - 1) * 30)
+        Native.RowArt(b, i)
+        local label = Label(b, "", 8, -6, 574, "GameFontHighlightSmall")
+        b:SetFontString(label)
+        b:SetScript("OnClick", function(self)
             if self.ticket then selectedTicket = self.ticket.id; RenderTickets() end
         end)
         ticketRows[i] = b
@@ -742,6 +872,8 @@ Build = function()
     Label(t, "После нажатия кнопки проверьте штатную команду игры и нажмите Enter. Сам переход требует согласия участника.", 0, -483, 950, "GameFontHighlightSmall")
 
     local l = pages.link
+    Native.Inset(l, -8, 8, 585, 502)
+    Native.Inset(l, 600, 8, 355, 502)
     Label(l, "Связь между гильдиями", 0, 0, 330, "GameFontNormalLarge")
     setupHint = Label(l, "", 0, -36, 565); setupHint:SetHeight(68); setupHint:SetJustifyV("TOP")
     contact = Edit(l, 7, -140, 350, "Полное имя офицера второй гильдии")
@@ -787,7 +919,7 @@ Build = function()
     announcementClear = Button(l, "Убрать", 785, -270, 160, function() SaveAnnouncement("") end)
     announcementHint = Label(l, "", 610, -311, 335, "GameFontHighlightSmall"); announcementHint:SetHeight(65); announcementHint:SetJustifyV("TOP")
     leaderInfo = Label(l, "", 610, -397, 335, "GameFontHighlightSmall"); leaderInfo:SetHeight(55); leaderInfo:SetJustifyV("TOP")
-    window:SetScript("OnHide", U.CloseRosterContextMenu)
+    window:SetScript("OnHide", function() U.CloseRosterContextMenu(); Native.ClearPageFocus() end)
     window:SetScript("OnShow", function() U.Refresh(); U.RefreshChat(); MarkRead() end)
     local tick = 0
     window:SetScript("OnUpdate", function(_, dt) tick = tick + dt; if tick > 2 then tick = 0; U.Refresh(); MarkRead() end end)
@@ -796,6 +928,7 @@ Build = function()
         if U.guild and name ~= U.me and entry.guild == U.OtherGuild() then usableContact = true; break end
     end
     page = not usableContact and U.IsTrustOfficer and U.IsTrustOfficer() and "link" or "roster"; pages[page]:Show()
+    Native.RefreshTabs()
     U.Refresh(); U.RefreshChat()
 end
 function U.Toggle()
