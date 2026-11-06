@@ -44,6 +44,216 @@ function Native.HasMethod(object, method)
     local kind = type(object)
     return (kind == "table" or kind == "userdata") and type(object[method]) == "function"
 end
+U.choiceButtons = {}
+function Native.ChoiceOptions(button)
+    local choice, entries = button.czuChoice, {}
+    local current = choice.getValue and choice.getValue()
+    for _, item in ipairs(choice.options()) do
+        if #entries >= 52 then break end
+        if type(item) == "table" and U.Text(item.text, 400) then
+            entries[#entries + 1] = { value = item.value, text = U.SafeDisplay(item.text),
+                enabled = item.enabled ~= false, checked = not choice.action and item.value == current }
+        end
+    end
+    return entries
+end
+function Native.RefreshChoice(button)
+    if not button then return end
+    local choice, text = button.czuChoice, button.czuChoice.label
+    if not choice.action then
+        for _, entry in ipairs(Native.ChoiceOptions(button)) do
+            if entry.checked then text = entry.text; break end
+        end
+    end
+    button:SetText(text)
+end
+function U.CloseChoiceMenu()
+    local context = U.choiceMenu
+    U.choiceMenu = nil
+    if not context then return end
+    context.active = false
+    if context.menu then context.menu:Hide() end
+    if context.dismiss then context.dismiss:Hide() end
+end
+function Native.ChoiceVisible(button)
+    local parent = button
+    for _ = 1, 20 do
+        if not parent then return true end
+        if not parent:IsShown() then return false end
+        parent = parent:GetParent()
+    end
+    return false
+end
+function Native.ChooseChoice(context, value)
+    local button = context.owner
+    if U.choiceMenu ~= context or not context.active or not window or not window:IsShown()
+        or page ~= context.page or U.guild ~= context.guild or not Native.ChoiceVisible(button) or not button:IsEnabled() then return false end
+    local allowed = false
+    for _, entry in ipairs(Native.ChoiceOptions(button)) do
+        if entry.value == value then allowed = entry.enabled; break end
+    end
+    U.CloseChoiceMenu()
+    if not allowed then return false end
+    if not button.czuChoice.action and button.czuChoice.getValue() == value then
+        Native.RefreshChoice(button); return true
+    end
+    button.czuChoice.choose(value)
+    Native.RefreshChoice(button)
+    return true
+end
+function Native.ChoiceHidden(menu)
+    local context = menu.czuChoiceContext
+    menu.czuChoiceContext = nil
+    if context and U.choiceMenu == context then
+        U.choiceMenu, context.active = nil, false
+        if context.dismiss then context.dismiss:Hide() end
+    end
+end
+function Native.ChoiceFallback(context)
+    local popup = Native.choicePopup
+    if not popup then
+        local dismiss = CreateFrame("Frame", "ChillZoneUnionChoiceDismiss", UIParent)
+        dismiss:SetAllPoints(UIParent); dismiss:SetFrameStrata("FULLSCREEN_DIALOG"); dismiss:EnableMouse(true)
+        dismiss:SetScript("OnMouseDown", U.CloseChoiceMenu); dismiss:Hide()
+        popup = CreateFrame("Frame", "ChillZoneUnionChoiceMenu", UIParent, "BackdropTemplate")
+        popup:SetFrameStrata("TOOLTIP"); popup:SetClampedToScreen(true); popup:EnableMouse(true)
+        popup:SetBackdrop({ bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 } })
+        popup:SetBackdropColor(0.08, 0.08, 0.08, 1)
+        popup.buttons, popup.dismiss = {}, dismiss
+        for index = 1, 12 do
+            local row = CreateFrame("Button", nil, popup)
+            row:SetPoint("TOPLEFT", 7, -7 - (index - 1) * 24); row:SetSize(286, 24)
+            row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+            row.label = Label(row, "", 25, -5, 250, "GameFontHighlightSmall")
+            row.label:SetHeight(16); row.label:SetWordWrap(false)
+            row.check = row:CreateTexture(nil, "OVERLAY"); row.check:SetSize(20, 20)
+            row.check:SetPoint("LEFT", 2, 0); row.check:SetTexture("Interface\\Buttons\\UI-CheckBox-Check")
+            popup.buttons[index] = row
+        end
+        popup.range = Label(popup, "", 12, -299, 276, "GameFontDisableSmall")
+        popup:SetScript("OnHide", function(self) Native.ChoiceHidden(self); self.dismiss:Hide() end)
+        popup:EnableMouseWheel(true)
+        popup:SetScript("OnMouseWheel", function(self, delta)
+            local active = U.choiceMenu
+            if active and active.menu == self then
+                active.offset = math.max(0, math.min(active.offset - delta * 3, math.max(0, #active.entries - 12)))
+                Native.RenderChoiceFallback(active)
+            end
+        end)
+        table.insert(UISpecialFrames, "ChillZoneUnionChoiceMenu")
+        popup:Hide(); Native.choicePopup = popup
+    end
+    context.menu, context.dismiss, context.offset = popup, popup.dismiss, 0
+    popup.czuChoiceContext = context
+    popup:ClearAllPoints(); popup:SetPoint("TOPLEFT", context.owner, "BOTTOMLEFT", 0, -2)
+    Native.RenderChoiceFallback(context)
+    popup.dismiss:Show(); popup:Show()
+end
+function Native.RenderChoiceFallback(context)
+    local popup, visible = context.menu, math.min(12, #context.entries)
+    popup:SetSize(300, 14 + visible * 24 + (#context.entries > 12 and 20 or 0))
+    for index, row in ipairs(popup.buttons) do
+        local entry = index <= visible and context.entries[index + context.offset] or nil
+        row.czuChoiceEntry = entry; row:SetShown(entry ~= nil)
+        if entry then
+            local callback = entry.callback
+            row:SetScript("OnClick", function() return callback() end)
+            row.label:SetText(entry.text); row.check:SetShown(entry.checked)
+            row.label:SetTextColor(entry.enabled and 1 or 0.5, entry.enabled and 1 or 0.5, entry.enabled and 1 or 0.5)
+            if entry.enabled then row:Enable() else row:Disable() end
+        else row:SetScript("OnClick", nil) end
+    end
+    popup.range:SetShown(#context.entries > 12)
+    popup.range:SetText((context.offset + 1) .. "–" .. (context.offset + visible) .. " из " .. #context.entries .. " • прокрутка мышью")
+end
+function Native.OpenChoice(button)
+    if not window or not window:IsShown() or not Native.ChoiceVisible(button) or not button:IsEnabled() then return false end
+    if U.choiceMenu and U.choiceMenu.owner == button then U.CloseChoiceMenu(); return false end
+    U.CloseChoiceMenu(); U.CloseRosterContextMenu(); Native.ClearPageFocus(); Native.ClearChoiceHover()
+    local context = { owner = button, key = button.czuChoiceKey, active = true, page = page, guild = U.guild,
+        entries = Native.ChoiceOptions(button), offset = 0 }
+    U.choiceMenu = context
+    for _, entry in ipairs(context.entries) do
+        local value = entry.value
+        entry.callback = function() return Native.ChooseChoice(context, value) end
+    end
+    if MenuUtil and type(MenuUtil.CreateContextMenu) == "function" then
+        context.menu = MenuUtil.CreateContextMenu(button, function(_, root)
+            root:CreateTitle(button.czuChoice.title)
+            if #context.entries > 12 then
+                local ok, scroll = pcall(function() return root.SetScrollMode end)
+                if ok and type(scroll) == "function" then root:SetScrollMode(288) end
+            end
+            for _, entry in ipairs(context.entries) do
+                local ok, radio = pcall(function() return root.CreateRadio end)
+                local description
+                if not button.czuChoice.action and ok and type(radio) == "function" then
+                    description = root:CreateRadio(entry.text,
+                        function(value) return button.czuChoice.getValue() == value end, entry.callback, entry.value)
+                else
+                    local check = entry.checked and "|TInterface\\Buttons\\UI-CheckBox-Check:14:14:0:0|t " or ""
+                    description = root:CreateButton(check .. entry.text, entry.callback)
+                end
+                description:SetEnabled(entry.enabled)
+            end
+        end)
+        if context.menu then
+            context.menu.czuChoiceContext = context
+            if not context.menu.czuChoiceOnHideHooked then
+                context.menu.czuChoiceOnHideHooked = true
+                context.menu:HookScript("OnHide", Native.ChoiceHidden)
+            end
+        else U.CloseChoiceMenu(); return false end
+    else Native.ChoiceFallback(context) end
+    return true
+end
+function Native.Choice(parent, key, label, x, y, width, options, getValue, choose, action)
+    local button = Button(parent, label, x, y, width)
+    button.czuChoiceKey = key
+    button.czuChoice = { label = label, title = label, options = options, getValue = getValue, choose = choose, action = action }
+    button.czuChoiceOptions = function() return Native.ChoiceOptions(button) end
+    button.czuChoiceValue = getValue
+    button.czuChoiceOpen = function() return Native.OpenChoice(button) end
+    button.czuChoiceArrow = button:CreateTexture(nil, "OVERLAY")
+    button.czuChoiceArrow:SetSize(12, 12); button.czuChoiceArrow:SetPoint("RIGHT", -9, 0)
+    button.czuChoiceArrow:SetTexture(ARROW_MEDIA .. "down")
+    local font = button:GetFontString()
+    if font then
+        font:ClearAllPoints(); font:SetPoint("LEFT", 10, 0); font:SetWidth(width - 34)
+        font:SetJustifyH("LEFT"); font:SetWordWrap(false)
+    end
+    button:SetScript("OnClick", button.czuChoiceOpen)
+    button:SetScript("OnHide", function(self) if U.choiceMenu and U.choiceMenu.owner == self then U.CloseChoiceMenu() end end)
+    U.choiceButtons[key] = button
+    return button
+end
+function Native.GuildChoices()
+    return { { value = 0, text = "Весь союз" }, { value = 1, text = U.GUILDS[1] }, { value = 2, text = U.GUILDS[2] } }
+end
+function Native.ChatChoices()
+    local entries, present = { { value = false, text = "Автоматически" } }, false
+    local saved = U.db.chatFrameName
+    local wanted = U.Text(saved, 128) and U.Fold(U.Trim(saved)) or nil
+    for _, name in ipairs(U.ChatWindowNames and U.ChatWindowNames() or {}) do
+        entries[#entries + 1] = { value = name, text = name }
+        if wanted and U.Fold(U.Trim(name)) == wanted then present = true end
+    end
+    if saved and not present then
+        entries[#entries + 1] = { value = saved, text = saved .. " (недоступно)", enabled = false }
+    end
+    return entries
+end
+function Native.ChatChoiceValue()
+    local saved = U.db.chatFrameName
+    if saved == nil then return false end
+    local wanted = U.Text(saved, 128) and U.Fold(U.Trim(saved)) or nil
+    for _, name in ipairs(U.ChatWindowNames and U.ChatWindowNames() or {}) do
+        if wanted and U.Fold(U.Trim(name)) == wanted then return name end
+    end
+    return saved
+end
 -- Let the client supply its own frame art: Forever replaces these templates with
 -- its bronze frame layout, while other compatible clients keep their own skin.
 function Native.Frame(kind, name, parent, templates)
@@ -125,11 +335,15 @@ local function Color(row)
     return 0.85, 0.87, 0.9
 end
 local rosterTooltipOwner, rosterContext, rosterContextFallback
+function Native.ClearChoiceHover()
+    for _, button in ipairs(rows) do button.czuHovered = nil end
+    rosterTooltipOwner = nil; GameTooltip:Hide()
+end
 local function RosterAddonInfo(row)
     return row and U.AddonInfo and U.AddonInfo(row.name, row.guild) or { known = false }
 end
 local function ShowRosterTooltip(button)
-    if rosterContext then return end
+    if rosterContext or U.choiceMenu then return end
     local row = button.row
     if not row or not button:IsShown() then return end
     local info = RosterAddonInfo(row)
@@ -151,7 +365,7 @@ local function ShowRosterTooltip(button)
     GameTooltip:Show()
 end
 function U.RosterRowEnter(button)
-    if rosterContext then button.czuHovered = nil; return end
+    if rosterContext or U.choiceMenu then button.czuHovered = nil; return end
     if rosterTooltipOwner and rosterTooltipOwner ~= button then rosterTooltipOwner.czuHovered = nil end
     button.czuHovered = true
     ShowRosterTooltip(button)
@@ -223,6 +437,7 @@ local function MarkRead()
     UpdateUnread()
 end
 local function Switch(which)
+    U.CloseChoiceMenu()
     U.CloseRosterContextMenu()
     Native.ClearPageFocus()
     page = which
@@ -326,6 +541,7 @@ local function FallbackContextMenu(context, entries)
     popup:Show()
 end
 function U.OpenRosterContextMenu(owner)
+    U.CloseChoiceMenu()
     U.CloseRosterContextMenu()
     local row = owner and owner.row
     if not row or not window or not window:IsShown() or page ~= "roster" then return false end
@@ -639,9 +855,9 @@ function Native.RenderLevelStats()
     Level.offset = math.max(0, math.min(Level.offset, math.max(0, #data.rows - #Level.rows)))
     local peak = 1
     for _, row in ipairs(data.rows) do local _, known = Native.LevelValue(row); peak = math.max(peak, known) end
-    Level.scopeButton:SetText(Level.scope == 0 and "Весь союз" or U.GUILDS[Level.scope])
-    Level.modeButton:SetText(Level.mode == "online" and "В сети" or "Все персонажи")
-    Level.stepButton:SetText(Level.step == 1 and "Каждый уровень" or ("По " .. Level.step .. " уровней"))
+    Native.RefreshChoice(Level.scopeButton)
+    Level.modeButton:SetChecked(Level.mode == "online")
+    Native.RefreshChoice(Level.stepButton)
     local freshness = {}
     for guild = 1, 2 do
         if Level.scope == 0 or Level.scope == guild then
@@ -680,16 +896,23 @@ function Native.BuildLevelStats(body)
     Label(p, "Распределение по уровням", 155, -4, 460, "GameFontNormalLarge")
     Button(p, "По классам", 630, 0, 180, function() U.OpenClassStats() end).czuLevelAction = "classes"
     Button(p, "Обновить", 820, 0, 130, function() U.RequestRoster(); U.snapshotDue = 0; Native.RenderLevelStats() end).czuLevelAction = "refresh"
-    Level.scopeButton = Button(p, "Весь союз", 0, -40, 270, function()
-        Level.scope = (Level.scope + 1) % 3; Level.offset = 0; Native.RenderLevelStats()
-    end); Level.scopeButton.czuLevelAction = "scope"
-    Level.modeButton = Button(p, "Все персонажи", 285, -40, 150, function()
-        Level.mode = Level.mode == "total" and "online" or "total"; Native.RenderLevelStats()
-    end); Level.modeButton.czuLevelAction = "mode"
-    Level.stepButton = Button(p, "По 10 уровней", 450, -40, 180, function()
-        Level.step = Level.step == 10 and 5 or Level.step == 5 and 1 or 10
-        Level.offset = 0; Native.RenderLevelStats()
-    end); Level.stepButton.czuLevelAction = "step"
+    Level.scopeButton = Native.Choice(p, "level-scope", "Весь союз", 0, -40, 270, Native.GuildChoices,
+        function() return Level.scope end,
+        function(value) Level.scope, Level.offset = value, 0; Native.RenderLevelStats() end)
+    Level.scopeButton.czuLevelAction = "scope"
+    Level.modeButton = CreateFrame("CheckButton", nil, p, "UICheckButtonTemplate")
+    Level.modeButton:SetSize(24, 24); Level.modeButton:SetPoint("TOPLEFT", 285, -40)
+    Label(p, "Только онлайн", 313, -47, 130, "GameFontHighlightSmall")
+    Level.modeButton:SetScript("OnClick", function(self)
+        Level.mode, Level.offset = self:GetChecked() == true and "online" or "total", 0
+        Native.RenderLevelStats()
+    end)
+    Level.modeButton.czuLevelAction = "mode"
+    Level.stepButton = Native.Choice(p, "level-step", "По 10 уровней", 450, -40, 180,
+        function() return { { value = 1, text = "Каждый уровень" }, { value = 5, text = "По 5 уровней" }, { value = 10, text = "По 10 уровней" } } end,
+        function() return Level.step end,
+        function(value) Level.step, Level.offset = value, 0; Native.RenderLevelStats() end)
+    Level.stepButton.czuLevelAction = "step"
     Level.summary = Label(p, "", 0, -76, 950, "GameFontHighlightSmall")
     Level.summary:SetHeight(31); Level.summary:SetJustifyV("TOP")
     p.summary = Level.summary
@@ -802,7 +1025,7 @@ function Native.RenderOverview()
     end)
     Overview.offset = math.max(0, math.min(Overview.offset, math.max(0, #locations - #Overview.rows)))
     local peak = #locations > 0 and math.max(1, locations[1].count) or 1
-    Overview.scopeButton:SetText(Overview.scope == 0 and "Весь союз" or U.GUILDS[Overview.scope])
+    Native.RefreshChoice(Overview.scopeButton)
     Overview.range:SetText((#locations > 0 and Overview.offset + 1 or 0) .. "–" .. math.min(Overview.offset + #Overview.rows, #locations) .. " из " .. #locations)
     Enable(Overview.previous, Overview.offset > 0)
     Enable(Overview.next, Overview.offset + #Overview.rows < #locations)
@@ -858,9 +1081,10 @@ function Native.BuildOverview(body)
         Overview.cards[guild] = frame
     end
     Overview.summary = Label(p, "", 0, -176, 950, "GameFontHighlightSmall")
-    Overview.scopeButton = Button(p, "Весь союз", 0, -204, 245, function()
-        Overview.scope = (Overview.scope + 1) % 3; Overview.offset = 0; Native.RenderOverview()
-    end); Overview.scopeButton.czuOverviewAction = "scope"
+    Overview.scopeButton = Native.Choice(p, "overview-scope", "Весь союз", 0, -204, 245, Native.GuildChoices,
+        function() return Overview.scope end,
+        function(value) Overview.scope, Overview.offset = value, 0; Native.RenderOverview() end)
+    Overview.scopeButton.czuOverviewAction = "scope"
     Overview.pins = CreateFrame("CheckButton", nil, p, "UICheckButtonTemplate")
     Overview.pins:SetSize(24, 24); Overview.pins:SetPoint("TOPLEFT", 270, -204); Overview.pins.czuOverviewAction = "pins"
     Label(p, "Метки союза на карте", 298, -211, 280, "GameFontHighlightSmall")
@@ -1002,7 +1226,7 @@ RenderLinks = function()
     diagnostics:SetText("Состояние соединения\n" .. U.Status() .. "\nВерсия аддона: " .. U.VERSION)
     badgeCheck:SetChecked(U.db.showGuildBadge == true)
     noticesCheck:SetChecked(U.db.memberNotices == true)
-    chatWindowButton:SetText("Чат: " .. U.SafeDisplay(U.db.chatFrameName or "автоматически"))
+    Native.RefreshChoice(chatWindowButton)
     local a = RenderAnnouncement()
     local master = ready and U.IsMaster()
     Enable(announcementEdit, master); Enable(announcementSave, master); Enable(announcementClear, master)
@@ -1154,16 +1378,16 @@ Build = function()
     guildCounts = Label(r, "", 0, -21, 950, "GameFontHighlightSmall")
     search = Edit(r, 7, -60, 280, "Имя, класс, звание или локация")
     search:SetScript("OnTextChanged", function() U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster() end)
-    guildButton = Button(r, "Весь союз", 310, -61, 180, function()
-        U.CloseRosterContextMenu()
-        guildFilter = (guildFilter + 1) % 3; offset = 0
-        guildButton:SetText(guildFilter == 0 and "Весь союз" or U.GUILDS[guildFilter]); RenderRoster()
-    end)
+    guildButton = Native.Choice(r, "roster-scope", "Весь союз", 310, -61, 180, Native.GuildChoices,
+        function() return guildFilter end,
+        function(value) guildFilter, offset, selected = value, 0, nil; RenderRoster() end)
     offline = CreateFrame("CheckButton", nil, r, "UICheckButtonTemplate"); offline:SetSize(24, 24); offline:SetPoint("TOPLEFT", 510, -60)
     Label(r, "Показывать офлайн", 538, -67, 160, "GameFontHighlightSmall")
     offline:SetScript("OnClick", function() U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster() end)
     Button(r, "Обновить", 820, -61, 130, function() U.RequestRoster(); U.snapshotDue = 0 end)
-    Button(r, "Статистика", 705, -61, 105, function() U.OpenClassStats() end)
+    Native.Choice(r, "roster-statistics", "Статистика", 705, -61, 105,
+        function() return { { value = "classes", text = "По классам" }, { value = "levels", text = "По уровням" } } end,
+        nil, function(value) if value == "classes" then U.OpenClassStats() else U.OpenLevelStats() end end, true)
     Native.Inset(r, -8, -94, 966, 320)
     local function SortHeader(key, title, x, width)
         local b = Native.Frame("Button", "ChillZoneUnionColumn" .. key, r,
@@ -1318,14 +1542,14 @@ Build = function()
         if U.SetGuildBadge then U.SetGuildBadge(self:GetChecked() == true) else U.db.showGuildBadge = self:GetChecked() == true; U.RefreshChat() end
     end)
     Label(l, "Вкладка обычного чата", 610, -77, 335, "GameFontNormalSmall")
-    chatWindowButton = Button(l, "", 610, -99, 335, function()
-        local names = U.ChatWindowNames and U.ChatWindowNames() or {}
-        local index = 0
-        for i, name in ipairs(names) do if name == U.db.chatFrameName then index = i; break end end
-        local name = names[index + 1]
-        if U.SetChatWindow then local ok, why = U.SetChatWindow(name); if not ok and why then U.Print(why) end end
-        RenderLinks()
-    end)
+    chatWindowButton = Native.Choice(l, "chat-window", "Автоматически", 610, -99, 335, Native.ChatChoices,
+        Native.ChatChoiceValue,
+        function(value)
+            local name
+            if value ~= false then name = value end
+            if U.SetChatWindow then local ok, why = U.SetChatWindow(name); if not ok and why then U.Print(why) end end
+            RenderLinks()
+        end)
     noticesCheck = CreateFrame("CheckButton", nil, l, "UICheckButtonTemplate"); noticesCheck:SetSize(24, 24); noticesCheck:SetPoint("TOPLEFT", 610, -139)
     Label(l, "Сообщать о вступлениях и выходах из гильдий", 638, -146, 307, "GameFontHighlightSmall")
     noticesCheck:SetScript("OnClick", function(self) U.db.memberNotices = self:GetChecked() == true end)
@@ -1342,7 +1566,7 @@ Build = function()
     announcementClear = Button(l, "Убрать", 785, -270, 160, function() SaveAnnouncement("") end)
     announcementHint = Label(l, "", 610, -311, 335, "GameFontHighlightSmall"); announcementHint:SetHeight(65); announcementHint:SetJustifyV("TOP")
     leaderInfo = Label(l, "", 610, -397, 335, "GameFontHighlightSmall"); leaderInfo:SetHeight(55); leaderInfo:SetJustifyV("TOP")
-    window:SetScript("OnHide", function() U.CloseRosterContextMenu(); Native.ClearPageFocus() end)
+    window:SetScript("OnHide", function() U.CloseChoiceMenu(); U.CloseRosterContextMenu(); Native.ClearPageFocus() end)
     window:SetScript("OnShow", function() U.Refresh(); U.RefreshChat(); MarkRead() end)
     local tick = 0
     window:SetScript("OnUpdate", function(_, dt) tick = tick + dt; if tick > 2 then tick = 0; U.Refresh(); MarkRead() end end)
@@ -1412,7 +1636,7 @@ function U.OpenLocationRoster(name, scope)
     if scope ~= 1 and scope ~= 2 then scope = 0 end
     search:SetText(""); offline:SetChecked(false)
     guildFilter, offset, selected = scope, 0, nil
-    guildButton:SetText(scope == 0 and "Весь союз" or U.GUILDS[scope])
+    Native.RefreshChoice(guildButton)
     Overview.location = { name = label, key = U.Fold(label), unknown = label == "" }
     window:Show(); Switch("roster")
     return true

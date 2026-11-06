@@ -300,6 +300,30 @@ local function FrameVisible(frame)
     end
     return true
 end
+-- Exercise real choice popup rows while preserving the strict native mock
+-- used independently by roster context-menu tests.
+local function SelectChoice(c, owner, value)
+    local nativeMenu = c.E.MenuUtil
+    c.E.MenuUtil = nil
+    local ok, reason = pcall(function()
+        expect(owner and owner.scripts.OnClick, "choice control has no click handler")
+        local opened = owner.scripts.OnClick(owner)
+        local context = c.U.choiceMenu
+        expect(context and context.active and context.owner == owner, "choice click did not open its own menu: key="
+            .. tostring(owner.czuChoiceKey) .. "; visible=" .. tostring(FrameVisible(owner)) .. "; result=" .. tostring(opened))
+        local selected
+        for _, row in ipairs(context.menu.buttons or {}) do
+            local entry = row.czuChoiceEntry
+            if row:IsShown() and entry and entry.value == value then selected = row end
+        end
+        expect(selected and selected:IsEnabled(), "requested choice is missing or disabled: " .. tostring(value))
+        selected.scripts.OnClick(selected)
+        expect(not context.active and not context.menu:IsShown(), "choice callback did not close its popup")
+    end)
+    c.E.MenuUtil = nativeMenu
+    expect(ok, reason)
+end
+
 -- Exercise periodic UI/map drivers independently of transport timers so a
 -- handcrafted statistics roster remains authoritative during UI assertions.
 local function RunUIUpdates(client, elapsed)
@@ -1809,7 +1833,7 @@ local function RosterControls(c)
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
-        if frame.frameType == "Button" and frame.width == 180 and frame.parent and frame.parent.move then filter = frame end
+        if frame.czuChoiceKey == "roster-scope" then filter = frame end
         if frame.czuLocationClear then clear = frame end
     end
     expect(search and offline and filter and clear, "location navigation needs complete roster filter controls")
@@ -1853,7 +1877,7 @@ do
     local search, offline, guildFilter, clear = RosterControls(c)
     search:SetText("Remote"); search.scripts.OnTextChanged(search, true)
     offline:SetChecked(true); offline.scripts.OnClick(offline)
-    guildFilter.scripts.OnClick(guildFilter)
+    SelectChoice(c, guildFilter, 1)
     search:SetFocus(); U.OpenOverview()
     local page, controls = E.ChillZoneUnionOverview, OverviewControls(c)
     expect(page and FrameVisible(page), "ordinary member could not open the separate overview page")
@@ -1950,14 +1974,14 @@ do
     expect(not clear:IsShown(), "clear location action left its filter chip shown")
     eq(#VisibleRoster(c), 7, "clearing exact location did not restore the fresh online roster")
 
-    U.OpenOverview(); controls.scope.scripts.OnClick(controls.scope)
+    U.OpenOverview(); SelectChoice(c, controls.scope, 1)
     eq(controls.scope:GetText(), U.GUILDS[1], "overview scope did not select the first guild")
     eq(#VisibleLocations(c), 2, "own-guild overview scope included remote-only zones")
     elwynn = VisibleLocation(c, "elwynn"); eq(elwynn.count:GetText(), "2", "guild scope did not change location counts")
     elwynn.scripts.OnClick(elwynn)
     roster = VisibleRoster(c); eq(#roster, 2, "guild-scoped location did not preserve its roster scope")
     for _, member in ipairs(roster) do eq(member.guild, 1, "own-guild location click included another guild") end
-    U.OpenOverview(); controls.scope.scripts.OnClick(controls.scope)
+    U.OpenOverview(); SelectChoice(c, controls.scope, 2)
     eq(controls.scope:GetText(), U.GUILDS[2], "overview scope did not select the second guild")
     elwynn = VisibleLocation(c, "elwynn"); elwynn.scripts.OnClick(elwynn)
     roster = VisibleRoster(c); eq(#roster, 1, "remote-guild location scope did not restrict the roster")
@@ -1967,7 +1991,7 @@ do
     U.OpenOverview()
     eq(#VisibleLocations(c), 0, "stale guild scope continued showing old zones")
     expect(page.empty:IsShown() and page.empty:GetText() ~= "", "stale guild scope has no visible unknown-data state")
-    controls.scope.scripts.OnClick(controls.scope)
+    SelectChoice(c, controls.scope, 0)
     eq(#VisibleLocations(c), 2, "partial union overview lost fresh locations")
     eq(VisibleLocation(c, "elwynn").count:GetText(), "2 + ?", "partial union location count was presented as complete")
     expect(cards[2].counts:GetText():find("? / 5", 1, true), "stale guild card did not retain total with unknown presence")
@@ -2266,7 +2290,7 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
-        if frame.text == "Весь союз" and not frame.czuLevelAction and not frame.czuOverviewAction then guildFilter = frame end
+        if frame.czuChoiceKey == "roster-scope" then guildFilter = frame end
         if frame.text == "Статистика" then openStats = frame end
         if frame.text == "К списку" and frame.czuLevelAction ~= "back" then back = frame end
     end
@@ -2274,11 +2298,11 @@ do
     expect(not c.U.IsMaster() and not c.U.IsOfficer(), "statistics UI fixture unexpectedly has officer privileges")
     search:SetText("Воин Чиллзон"); search.scripts.OnTextChanged(search, true)
     offline:SetChecked(false); offline.scripts.OnClick(offline)
-    guildFilter.scripts.OnClick(guildFilter)
+    SelectChoice(c, guildFilter, 1)
     local visibleRoster = 0
     for _, frame in ipairs(c.allFrames) do if frame.row and frame:IsShown() then visibleRoster = visibleRoster + 1 end end
     eq(visibleRoster, 1, "roster filters did not restrict class statistics independence fixture")
-    openStats.scripts.OnClick(openStats)
+    SelectChoice(c, openStats, "classes")
     expect(back.parent:IsShown() and not search.parent:IsShown(), "ordinary member could not open separate class statistics page")
     local function VisibleClass(token)
         for _, frame in ipairs(c.allFrames) do if frame.statsRow and frame.statsRow.class == token and frame:IsShown() then return frame end end
@@ -2319,7 +2343,7 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
-        if frame.text == "Весь союз" and not frame.czuLevelAction and not frame.czuOverviewAction then guildFilter = frame end
+        if frame.czuChoiceKey == "roster-scope" then guildFilter = frame end
         if frame.text == "Статистика" then statistics = frame end
         if frame.text == "По уровням" then toLevels = frame end
         if frame.text == "К списку" and not frame.czuLevelAction then classBack = frame end
@@ -2328,10 +2352,10 @@ do
     expect(not c.U.IsMaster() and not c.U.IsOfficer(), "level chart fixture unexpectedly has officer privileges")
     search:SetText(c.name); search.scripts.OnTextChanged(search, true)
     offline:SetChecked(false); offline.scripts.OnClick(offline)
-    guildFilter.scripts.OnClick(guildFilter)
+    SelectChoice(c, guildFilter, 1)
     local selectedGuild = guildFilter:GetText()
     local rosterTab = c.E.ChillZoneUnionWindowTab1
-    statistics.scripts.OnClick(statistics)
+    SelectChoice(c, statistics, "classes")
     expect(classBack.parent:IsShown(), "statistics action did not open class statistics")
     toLevels.scripts.OnClick(toLevels)
     local chart = c.E.ChillZoneUnionLevelStatistics
@@ -2341,13 +2365,17 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.parent == chart and frame.czuLevelAction then
             controls[frame.czuLevelAction] = frame
-            eq(frame.frameType, "Button", "level chart control is not a native button")
+            eq(frame.frameType, frame.czuLevelAction == "mode" and "CheckButton" or "Button", "level chart control has the wrong native type")
         end
     end
     for _, action in ipairs({ "back", "classes", "refresh", "scope", "mode", "step", "previous", "next" }) do
         expect(controls[action] and controls[action].scripts.OnClick, "level chart control missing: " .. action)
     end
     local function Click(action) controls[action].scripts.OnClick(controls[action]) end
+    local function Online(value)
+        controls.mode:SetChecked(value); Click("mode")
+        eq(controls.mode:GetChecked(), value, "online checkbox did not retain its selected state")
+    end
     local function Visible(lower, upper, unknown)
         for _, frame in ipairs(c.allFrames) do
             local row = frame.levelRow
@@ -2366,7 +2394,7 @@ do
         return table.concat(lines, "\n")
     end
     eq(controls.scope:GetText(), "Весь союз", "default chart scope must include both guilds")
-    eq(controls.mode:GetText(), "Все персонажи", "default chart must show all characters")
+    eq(controls.mode:GetChecked(), false, "default chart must show all characters")
     eq(controls.step:GetText(), "По 10 уровней", "default chart grouping is not ten levels")
     local first = Visible(1, 9)
     eq(first.name:GetText(), first.levelRow.label, "level chart label is inconsistent with its boundaries")
@@ -2404,44 +2432,43 @@ do
     expect(First().levelRow.lower > 1, "mouse wheel did not scroll graph rows")
     chart.scripts.OnMouseWheel(chart, 1)
     eq(First().levelRow.lower, 1, "mouse wheel did not return to graph start")
-    Click("scope")
+    SelectChoice(c, controls.scope, 1)
     eq(controls.scope:GetText(), c.U.GUILDS[1], "scope did not switch to first guild")
     eq(Visible(1, 9).value:GetText(), "2", "first-guild scope shows another guild's members")
     eq(Visible(1, 9).bar.maxValue, 2, "scope did not recalculate peak over selected guild")
-    Click("scope")
+    SelectChoice(c, controls.scope, 2)
     eq(controls.scope:GetText(), c.U.GUILDS[2], "scope did not switch to second guild")
     eq(Visible(1, 9).value:GetText(), "0", "second-guild empty bucket inherited first-guild population")
     expect(not Visible(1, 9).bar:IsShown(), "empty selected-guild bucket has a visible bar")
-    Click("scope")
-    eq(controls.scope:GetText(), "Весь союз", "scope does not cycle back to union")
-    Click("mode")
-    eq(controls.mode:GetText(), "В сети", "chart mode did not switch to online characters")
+    SelectChoice(c, controls.scope, 0)
+    eq(controls.scope:GetText(), "Весь союз", "scope did not select the union")
+    Online(true)
     eq(Visible(1, 9).value:GetText(), "1", "online chart counted offline characters")
     eq(Visible(1, 9).counts:GetText(), "1 / 2", "mode switch discarded independent online/total counters")
     eq(Visible(1, 9).bar.value, 1, "online graph does not use online count")
     eq(Visible(1, 9).bar.maxValue, 2, "online graph scale uses total population")
-    Click("mode")
-    eq(Visible(1, 9).value:GetText(), "2", "chart mode does not cycle back to all characters")
-    Click("step")
+    Online(false)
+    eq(Visible(1, 9).value:GetText(), "2", "online checkbox did not restore all characters")
+    SelectChoice(c, controls.step, 5)
     eq(controls.step:GetText(), "По 5 уровней", "chart grouping did not switch to five levels")
     eq(Visible(1, 4).value:GetText(), "1", "five-level graph retained decade counts")
     eq(Visible(5, 9).value:GetText(), "1", "five-level graph misplaced level nine")
-    Click("step")
+    SelectChoice(c, controls.step, 1)
     eq(controls.step:GetText(), "Каждый уровень", "chart grouping did not switch to individual levels")
     eq(Visible(1, 1).value:GetText(), "1", "individual-level graph retained grouped counts")
     Click("next")
     expect(First().levelRow.lower > 1, "individual-level graph cannot page beyond initial levels")
     Click("previous")
     eq(First().levelRow.lower, 1, "individual-level previous page did not return to level one")
-    Click("step")
-    eq(controls.step:GetText(), "По 10 уровней", "chart grouping does not cycle back to ten levels")
+    SelectChoice(c, controls.step, 10)
+    eq(controls.step:GetText(), "По 10 уровней", "chart grouping did not select ten levels")
     eq(First().levelRow.lower, 1, "grouping change retained an out-of-range scroll offset")
     c.U.db.rosters[2].rows["New Level"] = { name = "New Level", guild = 2, level = 1, online = false, class = "PRIEST" }
     c.U.Refresh()
     eq(Visible(1, 9).value:GetText(), "3", "active level chart did not refresh membership changes")
     eq(Visible(1, 9).counts:GetText(), "1 / 3", "active level chart counters did not refresh")
     c.U.db.rosters[2].rows["New Level"] = nil
-    freshness[2] = false; Click("mode"); c.U.Refresh()
+    freshness[2] = false; Online(true); c.U.Refresh()
     eq(Visible(1, 9).value:GetText(), "1 + ?", "stale remote online population is shown as a precise number")
     eq(Visible(1, 9).counts:GetText(), "1 + ? / 2", "stale graph counters lost known online subtotal")
     eq(Visible(1, 9).bar.value, 1, "stale graph bar includes cached online flags")
@@ -2451,7 +2478,7 @@ do
     expect(tip:find("Доля среди известных: 25.0%", 1, true), "stale graph share fails to identify known population")
     c.U.db.rosters[2] = nil; c.U.Refresh()
     eq(Visible(1, 9).counts:GetText(), "1 + ? / 2 + ?", "missing remote roster lost known level subtotal or unknown marker")
-    Click("mode")
+    Online(false)
     eq(Visible(1, 9).value:GetText(), "2 + ?", "missing guild was rendered as a complete level total")
     eq(Visible(30, 39).value:GetText(), "?", "missing guild falsely certifies an empty level population")
     expect(not Visible(30, 39).bar:IsShown(), "fully unknown level population has a positive bar")
@@ -2880,7 +2907,7 @@ do
     local roster, search, guildFilter, offline, sortHeader, close = target.parent
     for _, frame in ipairs(owner.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
-        if frame.text == "Весь союз" and not frame.czuLevelAction and not frame.czuOverviewAction then guildFilter = frame end
+        if frame.czuChoiceKey == "roster-scope" then guildFilter = frame end
         if frame.frameType == "CheckButton" and frame.parent == roster then offline = frame end
         if frame.sortTitle == "Имя" then sortHeader = frame end
         if frame.template == "UIPanelCloseButton" then close = frame end
@@ -2892,8 +2919,8 @@ do
     Closes(function() roster.scripts.OnMouseWheel(roster, -1) end, "scrolling left old character context menu open")
     Closes(function() search:SetText(member.name); search.scripts.OnTextChanged(search, true) end, "search change left character context menu open")
     search:SetText(""); search.scripts.OnTextChanged(search, true)
-    Closes(function() guildFilter.scripts.OnClick(guildFilter) end, "guild filter left character context menu open")
-    guildFilter.scripts.OnClick(guildFilter); guildFilter.scripts.OnClick(guildFilter)
+    Closes(function() SelectChoice(owner, guildFilter, 1) end, "guild filter left character context menu open")
+    SelectChoice(owner, guildFilter, 0)
     Closes(function() offline:SetChecked(true); offline.scripts.OnClick(offline) end, "offline filter left character context menu open")
     Closes(function() sortHeader.scripts.OnClick(sortHeader) end, "sorting left character context menu open")
     Closes(function() owner.U.OpenChat() end, "tab switch left character context menu open")
