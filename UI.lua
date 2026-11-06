@@ -8,6 +8,7 @@ local classOffset, classRange, classSummary = 0
 local search, offline, counts, guildCounts, status, guildButton, chatBox, chatLog, chatJump, announcementBanner
 local acceptButton, declineButton, leaveButton, inviteButton, ticketInfo
 local contact, connectButton, setupHint, setupProgress, diagnostics, leaderInfo
+local Setup = { steps = {}, advanced = false }
 local badgeCheck, noticesCheck, chatWindowButton, announcementEdit, announcementSave, announcementClear, announcementHint
 local headerDot, headerState
 local announcementDirty, unread = false, 0
@@ -162,17 +163,39 @@ function U.RosterRowLeave(button)
         GameTooltip:Hide()
     end
 end
+local function PendingRequest()
+    return U.IsTrustOfficer and U.IsTrustOfficer() and U.PendingLink and U.PendingLink() or nil
+end
+local function ConnectionView()
+    if U.ConnectionView then return U.ConnectionView() end
+    local ready, hasContacts = U.guild and U.own[U.me] ~= nil, false
+    for _, entry in pairs(U.db and U.db.contacts or {}) do
+        if entry.approved == true and entry.guild == U.OtherGuild() then hasContacts = true; break end
+    end
+    local role = not U.guild and "outside" or not ready and "loading"
+        or U.IsTrustOfficer and U.IsTrustOfficer() and "officer"
+        or U.CanRelay and U.CanRelay() and "relay" or "member"
+    local setup = U.SetupState and U.SetupState() or {}
+    return { role = role, stage = U.Connected() and "connected" or PendingRequest() and "pending" or setup.state or "idle",
+        message = setup.message, hasContacts = hasContacts, connected = U.Connected() }
+end
 local function Connection()
     if not U.guild then return "Вне гильдии", 0.55, 0.58, 0.62 end
+    if PendingRequest() then return "Требуется ваше подтверждение", 1, 0.78, 0.2 end
     if U.Connected() then return "Союз на связи", 0.3, 0.85, 0.57 end
     local setup = U.SetupState and U.SetupState()
     if setup and setup.state == "connecting" then return "Соединяемся", 0.95, 0.72, 0.3 end
+    if setup and setup.state == "declined" then return "Запрос отклонён", 0.95, 0.72, 0.3 end
+    if setup and setup.state == "expired" then return "Время ожидания истекло", 0.95, 0.72, 0.3 end
     return "Ожидаем связь", 0.7, 0.72, 0.76
 end
 local function RefreshConnection()
     local text, r, g, b = Connection()
     if headerDot then headerDot:SetVertexColor(r, g, b, 1) end
     if headerState then headerState:SetText(text) end
+    local pending = PendingRequest() ~= nil
+    if U.minimapButton and U.minimapButton.pendingMark then U.minimapButton.pendingMark:SetShown(pending) end
+    if tabs.link then tabs.link:SetText(pending and "Связь (!)" or "Связь"); Native.ResizeTab(tabs.link) end
 end
 local function ChatOffset()
     local n = chatLog and chatLog:GetScrollOffset()
@@ -875,7 +898,13 @@ function Native.BuildOverview(body)
 end
 function U.BuildLinkApprovalControls(parent)
     local controls = {}
-    controls.share = Button(parent, "Передать настройки", 350, -2, 215, function() U.ShareTrust() end)
+    controls.advanced = Button(parent, "Дополнительные действия", 0, -477, 240, function()
+        Setup.advanced = not Setup.advanced; RenderLinks()
+    end)
+    controls.share = Button(parent, "Повторно раздать настройки", 255, -477, 310, function() U.ShareTrust(); RenderLinks() end)
+    controls.share:Hide()
+    controls.shareHint = Label(parent, "", 0, -443, 565, "GameFontHighlightSmall")
+    controls.shareHint:SetHeight(30); controls.shareHint:SetJustifyV("TOP"); controls.shareHint:Hide()
     controls.info = Label(parent, "", 0, -253, 565, "GameFontHighlightSmall")
     controls.info:SetHeight(76); controls.info:SetJustifyV("TOP")
     controls.accept = Button(parent, "Разрешить запрос", 0, -339, 275)
@@ -894,10 +923,19 @@ local function RenderLinkApproval()
     local controls = U.linkApprovalControls
     if not controls then return end
     local officer = U.IsTrustOfficer and U.IsTrustOfficer()
-    Enable(controls.share, officer and not U.ChatLocked())
+    local view = ConnectionView()
+    controls.advanced:SetShown(officer and true or false)
+    controls.advanced:SetText(Setup.advanced and "Скрыть доп. действия" or "Дополнительные действия")
+    controls.share:SetShown(officer and Setup.advanced and true or false)
+    controls.shareHint:SetShown(officer and Setup.advanced and true or false)
+    if controls.footer then controls.footer:SetShown(not (officer and Setup.advanced)) end
+    controls.shareHint:SetText(view.hasContacts
+        and "Повторно отправить подтверждённые контакты участникам своей гильдии. При обычном подключении это происходит автоматически."
+        or "Сначала подтвердите первую связь. После этого здесь можно повторно раздать участникам проверенные настройки.")
+    Enable(controls.share, officer and view.hasContacts == true and not U.ChatLocked())
     local request = officer and U.PendingLink and U.PendingLink() or nil
-    controls.accept:SetShown(officer and true or false)
-    controls.decline:SetShown(officer and true or false)
+    controls.accept:SetShown(request ~= nil)
+    controls.decline:SetShown(request ~= nil)
     Enable(controls.accept, request ~= nil and not U.ChatLocked())
     Enable(controls.decline, request ~= nil)
     controls.accept:SetScript("OnClick", nil); controls.decline:SetScript("OnClick", nil)
@@ -911,23 +949,43 @@ local function RenderLinkApproval()
     elseif officer then
         controls.info:SetText("Новых запросов подключения нет.\nПосле первой настройки главы, офицеры и ветераны поддерживают связь автоматически.")
     else
-        controls.info:SetText("Связные: главы, офицеры и персонажи со званием «Ветеран».\nВетераны поддерживают настроенную связь, но не подтверждают новые контакты.")
+        controls.info:SetText(view.connected
+            and "Можно писать в обычный /г. Сообщения второй гильдии появятся в стандартном окне чата и на вкладке «Общий чат»."
+            or "Обычный /г вашей гильдии работает уже сейчас. Сообщения другой гильдии появятся после соединения союза.")
     end
 end
 RenderLinks = function()
     if not window then return end
     local ready = U.guild and U.own[U.me] ~= nil
+    local view = ConnectionView()
+    local officer, relay = view.role == "officer", view.role == "relay"
+    Setup.title:SetText((view.role == "member" or relay) and "Ручная настройка не требуется"
+        or view.heading or "Связь между гильдиями")
+    local step = view.stage == "pending" and 2 or view.connected and 3 or view.stage == "connecting" and 2 or 1
+    for index, label in ipairs(Setup.steps) do
+        label:SetShown(officer)
+        if step == 3 then label:SetTextColor(0.3, 0.85, 0.57)
+        elseif index == step then label:SetTextColor(1, 0.82, 0)
+        else label:SetTextColor(0.57, 0.6, 0.64) end
+    end
     if not U.guild then setupHint:SetText("Персонаж должен состоять в «Чиллзон» или «Чиллзон Навсегда».")
     elseif not ready then setupHint:SetText("Получаем состав и права вашей гильдии. Подождите несколько секунд.")
-    elseif not U.CanRelay or not U.CanRelay() then setupHint:SetText("Связными становятся главы, офицеры и персонажи со званием «Ветеран».\nОстальные участники пользуются общим чатом и составом без настройки связи.")
+    elseif not officer and not relay then setupHint:SetText("Вводить имена и настраивать соединение не нужно. Аддон получит настройки автоматически от главы или офицера вашей гильдии.")
     elseif U.ChatLocked() then setupHint:SetText("Игра временно ограничила обмен сообщениями. Соединение станет доступно после снятия ограничения.")
-    elseif not U.IsTrustOfficer or not U.IsTrustOfficer() then setupHint:SetText("Звание «Ветеран» позволяет поддерживать уже настроенную связь и подключаться к подтверждённым контактам.\nПервую настройку и новые контакты подтверждают только главы и офицеры.")
-    else setupHint:SetText("Первое соединение: введите полное имя главы или офицера другой гильдии и нажмите «Подключить».\nВторая сторона проверяет имя и разрешает запрос. Дальше связные выбираются и подключаются автоматически.") end
+    elseif relay then setupHint:SetText("Вы поддерживаете уже настроенную связь. Первое соединение и новые контакты подтверждают главы или офицеры; повторно настраивать союз не нужно.")
+    elseif view.stage == "pending" then setupHint:SetText("Это входящий запрос. Сверьте полное имя отправителя с руководителем второй гильдии, затем нажмите «Разрешить запрос» ниже.")
+    elseif view.connected then setupHint:SetText("Соединение настроено. Общий чат и состав работают; связные выбираются автоматически. Можно пользоваться обычным /г.")
+    elseif view.stage == "connecting" then setupHint:SetText("Дождитесь завершения соединения. Повторно вводить имя и раздавать настройки вручную обычно не требуется.")
+    else setupHint:SetText("Введите полное имя главы или офицера другой гильдии и нажмите «Подключить». Вторая сторона проверит имя и вручную разрешит запрос.") end
+    Setup.contactHint:SetShown(officer or relay)
+    contact:SetShown(officer or relay); connectButton:SetShown(officer or relay)
     Enable(contact, ready and U.CanRelay and U.CanRelay())
     local target = U.Name(contact:GetText() or "")
     Enable(connectButton, ready and target and U.CanStartLink and U.CanStartLink(target) and not U.ChatLocked())
     RenderLinkApproval()
-    if U.SetupState then
+    if view.message then
+        setupProgress:SetText(view.message)
+    elseif U.SetupState then
         local setup = U.SetupState()
         local text = setup.message or "Ожидаем соединение со второй гильдией."
         if U.Connected() then
@@ -937,6 +995,8 @@ RenderLinks = function()
         setupProgress:SetText(text)
     elseif U.LinkProgress then setupProgress:SetText(U.LinkProgress())
     else setupProgress:SetText(U.Connected() and "Общий чат подключён. Состав загружается автоматически." or "Ожидаем соединение со второй гильдией.") end
+    Setup.chat:SetShown(PendingRequest() == nil)
+    Setup.chat:ClearAllPoints(); Setup.chat:SetPoint("TOPLEFT", (officer or relay) and 290 or 0, (officer or relay) and -339 or -140)
     diagnostics:SetText("Состояние соединения\n" .. U.Status() .. "\nВерсия аддона: " .. U.VERSION)
     badgeCheck:SetChecked(U.db.showGuildBadge == true)
     noticesCheck:SetChecked(U.db.memberNotices == true)
@@ -1050,13 +1110,13 @@ Build = function()
     local body = Native.Inset(window, 14, -66, 972, 540)
     body:SetFrameLevel(window:GetFrameLevel() + 1)
     window.czuBody = body
-    Label(window, "Чиллзон  /  Чиллзон Навсегда", 80, -40, 660, "GameFontHighlightSmall")
+    Label(window, "Чиллзон  /  Чиллзон Навсегда", 80, -40, 625, "GameFontHighlightSmall")
     local indicator = CreateFrame("Button", nil, window)
-    indicator:SetSize(190, 24); indicator:SetPoint("TOPLEFT", 780, -34)
+    indicator:SetSize(245, 24); indicator:SetPoint("TOPLEFT", 725, -34)
     indicator:SetScript("OnClick", function() Switch("link") end)
     headerDot = indicator:CreateTexture(nil, "OVERLAY"); headerDot:SetSize(7, 7); headerDot:SetPoint("LEFT", 7, 0)
     headerDot:SetTexture("Interface\\AddOns\\ChillZoneUnion\\Media\\status-dot")
-    headerState = Label(indicator, "", 23, -6, 165, "GameFontHighlightSmall")
+    headerState = Label(indicator, "", 23, -6, 220, "GameFontHighlightSmall")
     local close = window.CloseButton
     if not Native.HasMethod(close, "SetScript") then
         close = CreateFrame("Button", nil, window, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -6, -5)
@@ -1224,11 +1284,15 @@ Build = function()
     Label(t, "После нажатия кнопки проверьте штатную команду игры и нажмите Enter. Сам переход требует согласия участника.", 0, -483, 950, "GameFontHighlightSmall")
 
     local l = pages.link
-    Native.Inset(l, -8, 8, 585, 502)
-    Native.Inset(l, 600, 8, 355, 502)
-    Label(l, "Связь между гильдиями", 0, 0, 330, "GameFontNormalLarge")
-    setupHint = Label(l, "", 0, -36, 565); setupHint:SetHeight(68); setupHint:SetJustifyV("TOP")
-    contact = Edit(l, 7, -140, 350, "Полное имя офицера второй гильдии")
+    Native.Inset(l, -8, 8, 585, 518)
+    Native.Inset(l, 600, 8, 355, 518)
+    Setup.title = Label(l, "Связь между гильдиями", 0, 0, 565, "GameFontNormalLarge")
+    Setup.steps[1] = Label(l, "1. Выбрать офицера", 0, -30, 170, "GameFontNormalSmall")
+    Setup.steps[2] = Label(l, "2. Дождаться подтверждения", 175, -30, 230, "GameFontNormalSmall")
+    Setup.steps[3] = Label(l, "3. Союз подключён", 410, -30, 155, "GameFontNormalSmall")
+    setupHint = Label(l, "", 0, -57, 565); setupHint:SetHeight(48); setupHint:SetJustifyV("TOP")
+    Setup.contactHint = Label(l, "Полное имя офицера второй гильдии", 7, -117, 350, "GameFontNormalSmall")
+    contact = Edit(l, 7, -140, 350)
     local prefill = U.db.setupContact
     if (not prefill or prefill == "") and U.guild and U.OtherGuild() == 1 and U.GUILD_LEADERS then prefill = U.GUILD_LEADERS[1] end
     contact:SetMaxBytes(160); contact:SetText(prefill or "")
@@ -1238,8 +1302,13 @@ Build = function()
     connectButton = Button(l, "Подключить", 380, -141, 185, Connect)
     setupProgress = Label(l, "", 0, -187, 565); setupProgress:SetHeight(60); setupProgress:SetJustifyV("TOP")
     U.BuildLinkApprovalControls(l)
+    Setup.chat = Button(l, "Открыть чат", 0, -140, 275, function() U.OpenChat() end)
     diagnostics = Label(l, "", 0, -379, 565, "GameFontHighlightSmall"); diagnostics:SetHeight(55); diagnostics:SetJustifyV("TOP")
-    Label(l, "Для настроенной связи нужен глава, офицер или ветеран онлайн с каждой стороны.\nНовая установка получает доверенные настройки только от своего главы или офицера.", 0, -443, 565, "GameFontHighlightSmall")
+    U.linkApprovalControls.footer = Label(l, "Для связи нужен глава, офицер или ветеран онлайн с каждой стороны. Новая установка получает настройки от своего главы или офицера.", 0, -443, 565, "GameFontHighlightSmall")
+    U.linkApprovalControls.footer:SetHeight(30); U.linkApprovalControls.footer:SetJustifyV("TOP")
+    window.czuSetupTitle, window.czuSetupHint, window.czuSetupProgress = Setup.title, setupHint, setupProgress
+    window.czuSetupChat, window.czuSetupSteps = Setup.chat, Setup.steps
+    window.czuContact, window.czuConnect = contact, connectButton
     Label(l, "Отображение", 610, 0, 335, "GameFontNormal")
     badgeCheck = CreateFrame("CheckButton", nil, l, "UICheckButtonTemplate"); badgeCheck:SetSize(24, 24); badgeCheck:SetPoint("TOPLEFT", 610, -33)
     Label(l, "Показывать гильдию рядом с именем в чате", 638, -40, 307, "GameFontHighlightSmall")
@@ -1275,17 +1344,31 @@ Build = function()
     window:SetScript("OnShow", function() U.Refresh(); U.RefreshChat(); MarkRead() end)
     local tick = 0
     window:SetScript("OnUpdate", function(_, dt) tick = tick + dt; if tick > 2 then tick = 0; U.Refresh(); MarkRead() end end)
-    local usableContact = false
-    for name, entry in pairs(U.db.contacts) do
-        if U.guild and name ~= U.me and entry.guild == U.OtherGuild() then usableContact = true; break end
-    end
-    page = not usableContact and U.IsTrustOfficer and U.IsTrustOfficer() and "link" or "roster"; pages[page]:Show()
+    page = "roster"; pages[page]:Show()
     Native.RefreshTabs()
     U.Refresh(); U.RefreshChat()
 end
 function U.Toggle()
     if not U.db then return end
-    if not window then Build() else window:SetShown(not window:IsShown()) end
+    if PendingRequest() and (not window or not window:IsShown() or page ~= "link") then U.OpenMain()
+    elseif window and window:IsShown() then window:Hide() else U.OpenMain() end
+end
+function U.OpenMain()
+    if not U.db then return end
+    local created = not window
+    if created then Build() end
+    local view = ConnectionView()
+    local seen = U.db.connectionIntroSeen
+    if type(seen) ~= "table" then seen = {}; U.db.connectionIntroSeen = seen end
+    local key = U.Fold(U.me or "") .. ":" .. tostring(U.guild or 0)
+    local firstMemberView = not seen[key] and view.role ~= "officer"
+    if PendingRequest() or firstMemberView or view.role == "officer" and not view.hasContacts then
+        window:Show(); Switch("link")
+        if view.role ~= "loading" and U.me then seen[key] = true end
+    else
+        window:Show()
+        if created then Switch("roster") end
+    end
 end
 function U.OpenRoster()
     if not U.db then return end
@@ -1345,7 +1428,7 @@ function U.MaybeShowSetup()
     if seen[key] then setupIntroPending = false; return end
     local configured = U.Connected()
     for name, entry in pairs(U.db.contacts) do
-        if name ~= U.me and entry.guild == U.OtherGuild() then configured = true; break end
+        if name ~= U.me and entry.approved == true and entry.guild == U.OtherGuild() then configured = true; break end
     end
     if configured then seen[key] = true; setupIntroPending = false; return end
     if InCombatLockdown() then return end
@@ -1356,6 +1439,30 @@ end
 U.On("PLAYER_LOGIN", function() setupIntroPending = true; U.MaybeShowSetup() end)
 U.On("GUILD_ROSTER_UPDATE", function() U.MaybeShowSetup() end)
 U.On("PLAYER_GUILD_UPDATE", function() U.MaybeShowSetup() end)
+
+local connectionNotices, connectionNoticeWindow, connectionNoticeCount = {}, -100, 0
+function U.NotifyConnectionRequest(request)
+    if type(request) ~= "table" or not U.IsTrustOfficer or not U.IsTrustOfficer() then return false end
+    local name, now = U.Name(request.name), U.clock()
+    local actual = name and U.inboundLinks and U.inboundLinks[name]
+    if not actual or actual.approved or actual.nonce ~= request.nonce or actual.guild ~= request.guild
+        or actual.untilAt ~= request.untilAt or now > actual.untilAt then return false end
+    RefreshConnection()
+    local key = name .. ":" .. tostring(actual.nonce)
+    if connectionNotices[key] then return false end
+    if now - connectionNoticeWindow >= 60 then connectionNoticeWindow, connectionNoticeCount = now, 0 end
+    if connectionNoticeCount >= 6 then return false end
+    for previous, untilAt in pairs(connectionNotices) do if now > untilAt then connectionNotices[previous] = nil end end
+    connectionNotices[key], connectionNoticeCount = actual.untilAt, connectionNoticeCount + 1
+    U.Print("Запрос соединения от " .. U.SafeDisplay(name)
+        .. " — |cff71d5ff|Haddon:ChillZoneUnion:connection|h[Открыть]|h|r")
+    return true
+end
+if hooksecurefunc and type(SetItemRef) == "function" then
+    hooksecurefunc("SetItemRef", function(link)
+        if link == "addon:ChillZoneUnion:connection" and PendingRequest() then U.OpenSettings() end
+    end)
+end
 
 local DEFAULT_MINIMAP_ANGLE = 225
 local function PositionMinimapButton(button)
@@ -1405,6 +1512,9 @@ U.On("PLAYER_LOGIN", function()
     b:RegisterForClicks("LeftButtonUp", "RightButtonUp"); b:RegisterForDrag("LeftButton")
     b.icon = b:CreateTexture(nil, "ARTWORK"); b.icon:SetSize(28, 28); b.icon:SetPoint("CENTER")
     b.icon:SetTexture("Interface\\AddOns\\ChillZoneUnion\\Media\\minimap")
+    b.pendingMark = b:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    b.pendingMark:SetPoint("TOPRIGHT", -1, 2); b.pendingMark:SetText("!"); b.pendingMark:SetTextColor(1, 0.82, 0)
+    b.pendingMark:Hide()
     local highlight = b:CreateTexture(nil, "HIGHLIGHT")
     highlight:SetAllPoints(); highlight:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
     highlight:SetBlendMode("ADD"); highlight:SetVertexColor(1, 0.78, 0.35, 0.7)
@@ -1412,8 +1522,7 @@ U.On("PLAYER_LOGIN", function()
         if self.dragging or (self.dragStopTime and GetTime() - self.dragStopTime < 0.15) then return end
         if button == "RightButton" then
             if IsShiftKeyDown and IsShiftKeyDown() then U.ResetMinimapPosition() else U.OpenSettings() end
-        elseif window and window:IsShown() and page == "roster" then window:Hide()
-        else U.OpenRoster() end
+        else U.Toggle() end
     end)
     b:SetScript("OnDragStart", function(self)
         self.dragging = true; GameTooltip:Hide(); DragMinimapButton(self)
@@ -1426,7 +1535,7 @@ U.On("PLAYER_LOGIN", function()
         GameTooltip:SetOwner(self, "ANCHOR_LEFT"); GameTooltip:SetText("Чиллзон — Союз гильдий")
         local text, r, g, blue = Connection()
         GameTooltip:AddLine(text, r, g, blue)
-        GameTooltip:AddLine("ЛКМ — состав союза", 0.8, 0.85, 0.9)
+        GameTooltip:AddLine(PendingRequest() and "ЛКМ — открыть запрос" or "ЛКМ — открыть или закрыть окно", 0.8, 0.85, 0.9)
         GameTooltip:AddLine("ПКМ — настройки", 0.8, 0.85, 0.9)
         GameTooltip:Show()
     end)

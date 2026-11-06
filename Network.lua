@@ -1,6 +1,6 @@
 local _, U = ...
 U.peers, U.links, U.inboundLinks, U.pings, U.probes = {}, {}, {}, {}, {}
-U.setup = { state = "idle", message = "Глава гильдии может указать офицера второй гильдии и нажать «Соединить»." }
+U.setup = { state = "idle", message = "Глава или офицер указывает полное имя офицера второй гильдии и нажимает «Подключить»." }
 local lastHello, lastPing, lastClean, lastAsk, lastChat = -100, -100, -100, -100, -100
 local remoteSeen, nativeHint, legacyTried = {}, -100, {}
 local lastLinkReply, replyWindow, replyCount = {}, -100, 0
@@ -96,7 +96,14 @@ function U.ShareTrust()
             jobs[#jobs + 1] = { kind = "CONTACT", fields = { name, contact.guild }, dist = "GUILD", priority = true }
         end
     end
-    if not U.QueueBatch(jobs) then return false end
+    if #jobs == 0 then
+        U.Print("Подтверждённых контактов пока нет. Сначала подключите вторую гильдию и дождитесь подтверждения.")
+        return false
+    end
+    if not U.QueueBatch(jobs) then
+        U.Print("Не удалось передать настройки: очередь сообщений заполнена. Повторите через несколько секунд.")
+        return false
+    end
     U.Print("Подтверждённые контакты отправлены участникам своей гильдии, которые сейчас в игре с аддоном. Связные выбираются автоматически.")
     return true
 end
@@ -273,6 +280,7 @@ function U.NetworkReset()
     wasConnected, disconnectedAt, outageNotified = false, nil, false
     U.peers, U.remote, U.linkState, U.gatewaySince = {}, nil, nil, nil
     U.links, U.inboundLinks, U.probes, U.pings = {}, {}, {}, {}
+    U.setup = { state = "idle", message = "Выберите офицера второй гильдии для первого подключения." }
     U.own = {}
     U.ClearQueue()
     if U.ElectionChanged then U.ElectionChanged() end
@@ -364,13 +372,17 @@ function U.Link(name)
         Setup("error", name, "Состав вашей гильдии ещё загружается. Повторите через несколько секунд.")
         U.Print(U.setup.message); return false
     end
-    if not U.CanStartLink(name) then
-        Setup("error", name, "Первое соединение настраивает глава или персонаж с игровыми офицерскими правами. Обычные участники не становятся связными.")
+    name = U.Name(name)
+    if not name then
+        Setup("error", nil, "Введите полное имя офицера второй гильдии: Имя Фамилия.")
         U.Print(U.setup.message); return false
     end
-    name = U.Name(name)
-    if not name or name == U.me or U.own[name] then
-        Setup("error", name, "Укажите полное имя офицера второй гильдии: Имя Фамилия.")
+    if name == U.me or U.own[name] then
+        Setup("error", name, "Укажите офицера второй гильдии. Этот персонаж состоит в вашей гильдии.")
+        U.Print(U.setup.message); return false
+    end
+    if not U.CanStartLink(name) then
+        Setup("error", name, "Первое соединение настраивает глава или персонаж с игровыми офицерскими правами. Обычные участники не становятся связными.")
         U.Print(U.setup.message); return false
     end
     if U.ChatLocked() then
@@ -411,21 +423,73 @@ function U.PendingLink()
     end
     if request then return { name = chosen, guild = request.guild, untilAt = request.untilAt } end
 end
+function U.ConnectionView()
+    local view = { connected = false, hasContacts = false, stage = "idle" }
+    if not U.db or not U.guild then
+        view.role, view.heading = "outside", "Вы не в гильдии союза"
+        view.message = "Аддон работает для «Чиллзон» и «Чиллзон Навсегда»."
+        return view
+    end
+    if not U.own[U.me] then
+        view.role, view.heading = "loading", "Загружаем состав гильдии"
+        view.message = "Подождите несколько секунд: проверяем игровые права и настройки союза."
+        return view
+    end
+    local officer = U.IsTrustOfficer()
+    view.role = officer and "officer" or U.CanRelay() and "relay" or "member"
+    for name, contact in pairs(U.db.contacts or {}) do
+        if contact.approved == true and contact.guild == U.OtherGuild() and not U.own[name] and U.Name(name) == name then
+            view.hasContacts = true; break
+        end
+    end
+    view.connected = U.Connected() == true
+    local pending = officer and U.PendingLink()
+    if pending then
+        view.stage, view.heading = "pending", "Требуется ваше подтверждение"
+        view.pendingName, view.pendingGuild = pending.name, pending.guild
+        view.message = "Запрос соединения от " .. U.SafeDisplay(pending.name)
+            .. ". Сверьте полное имя с руководителем второй гильдии, затем подтвердите или отклоните запрос. Внешняя гильдия и звание автоматически не проверены."
+    elseif view.connected then
+        view.stage, view.heading = "connected", "Союз подключён"
+        view.message = officer and "Общий чат и состав работают. Настройки участникам передаются автоматически."
+            or "Ручная настройка не требуется. Общий чат и состав работают; пишите в обычный /г или откройте чат здесь."
+    elseif not officer then
+        view.stage, view.heading = "connecting", "Ожидаем подключение союза"
+        view.message = view.hasContacts and "Ручная настройка не требуется. Ждём связного онлайн в каждой гильдии; аддон восстановит связь автоматически."
+            or "Ручная настройка не требуется. Ждём настроенного главу или офицера вашей гильдии онлайн, чтобы получить настройки союза."
+    else
+        local state = U.setup or {}
+        if state.state == "declined" or state.state == "expired" or state.state == "error" then
+            view.stage = state.state
+            view.heading = state.state == "declined" and "Запрос отклонён" or state.state == "expired" and "Время ожидания истекло" or "Подключение не выполнено"
+            view.message = state.message
+        elseif state.state == "connecting" then
+            view.stage, view.heading, view.message = "connecting", "Дождитесь подтверждения", state.message
+        elseif view.hasContacts then
+            view.stage, view.heading = "connecting", "Восстанавливаем связь"
+            view.message = "Настройки сохранены. Нужен настроенный связной онлайн с каждой стороны; повторное подключение вручную обычно не требуется."
+        else
+            view.heading = "Выберите офицера второй гильдии"
+            view.message = "Оба офицера должны быть онлайн с аддоном. Введите полное имя, нажмите «Подключить» и попросите второго офицера открыть запрос и подтвердить ваше имя."
+        end
+    end
+    return view
+end
 function U.AcceptLink(name)
     local canonical, request = InboundLink(name)
     if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt or U.ChatLocked() then return false end
     request.approved, request.challenge, request.manual = true, U.NewID(), true
     request.untilAt = U.clock() + HANDSHAKE_TIMEOUT
     ReplyLink(canonical, "challenge", request.nonce, request.challenge)
-    if U.Refresh then U.Refresh() end
+    Setup("connecting", canonical, "Запрос подтверждён. Дождитесь завершения соединения; повторно вводить имя не нужно.")
     return true
 end
 function U.DeclineLink(name)
     local canonical, request = InboundLink(name)
-    if not U.IsTrustOfficer() or not request or U.clock() > request.untilAt then return false end
+    if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt then return false end
     U.inboundLinks[canonical] = nil
     ReplyLink(canonical, "error", request.nonce, "declined")
-    if U.Refresh then U.Refresh() end
+    Setup("declined", canonical, "Вы отклонили запрос. Для нового подключения договоритесь со вторым офицером и попросите его отправить запрос заново либо введите его полное имя.")
     return true
 end
 local function OutgoingLink(sender, nonce, guild)
@@ -466,6 +530,7 @@ local function TakeLink(f, sender)
             p.challenge = U.NewID(); ReplyLink(sender, "challenge", nonce, p.challenge)
         else
             Setup("approval", sender, "Запрос соединения от " .. U.SafeDisplay(sender) .. ". Внешняя гильдия и ранг не проверены игрой. Проверьте полное имя с руководителем второй гильдии, затем подтвердите или отклоните запрос.")
+            if U.NotifyConnectionRequest then U.NotifyConnectionRequest({ name = sender, guild = guild, nonce = nonce, untilAt = p.untilAt }) end
             ReplyLink(sender, "wait", nonce, "approval")
         end
     elseif mode == "prove" then
@@ -514,7 +579,9 @@ local function TakeLink(f, sender)
             Setup("connecting", sender, "Ожидаем однократного подтверждения точного имени на второй стороне. Внешняя гильдия и роль не могут быть проверены этим аддоном автоматически.")
         elseif mode == "error" and (challenge == "declined" or challenge == "approval") then
             U.links[sender] = nil
-            Setup("error", sender, challenge == "declined" and "Вторая сторона отклонила запрос соединения." or "Новый контакт должен подтвердить настоящий глава или офицер второй гильдии.")
+            Setup(challenge == "declined" and "declined" or "error", sender, challenge == "declined"
+                and "Вторая сторона отклонила запрос. Сверьте полное имя и договоритесь о подключении, затем нажмите «Подключить» ещё раз."
+                or "Новый контакт должен подтвердить настоящий глава или офицер второй гильдии.")
             U.Print(U.setup.message)
         elseif mode == "error" and p.phase == "hello" and challenge == "officer" then
             U.links[sender] = nil
@@ -528,7 +595,7 @@ local function LinkTick(now)
         if now > p.untilAt then
             U.links[name] = nil
             if U.setup.target == name then
-                Setup("error", name, "Соединение не подтверждено за 3 минуты. Проверьте полное имя, онлайн, одинаковую актуальную версию аддона и подтверждение запроса на второй стороне.")
+                Setup("expired", name, "Соединение не подтверждено за 3 минуты. Сверьте полное имя, попросите второго офицера открыть запрос и нажмите «Подключить» ещё раз, когда оба будете онлайн с аддоном.")
                 U.Print(U.setup.message)
             end
         elseif now >= p.nextAt then
@@ -536,7 +603,14 @@ local function LinkTick(now)
             p.nextAt = now + LINK_RETRY
         end
     end
-    for name, p in pairs(U.inboundLinks) do if now > p.untilAt then U.inboundLinks[name] = nil end end
+    for name, p in pairs(U.inboundLinks) do
+        if now > p.untilAt then
+            U.inboundLinks[name] = nil
+            if not p.completed and U.setup.target == name then
+                Setup("expired", name, "Время ожидания запроса истекло. Попросите второго офицера отправить запрос заново либо введите его полное имя и нажмите «Подключить».")
+            end
+        end
+    end
 end
 function U.Status()
     if not U.guild then return "Вы не в одной из гильдий союза." end
@@ -863,6 +937,7 @@ function U.Handle(kind, f, dist, sender, id)
             -- consent/READY broadcasts. Resync only through the current gateway.
             if U.TransferSyncFor then U.TransferSyncFor(sender) end
             if sender == gateway and U.TransferSyncRequest then U.TransferSyncRequest() end
+            if U.IsGateway() and U.TransferSyncRequest then U.TransferSyncRequest(false, sender) end
             if fresh and U.IsGateway() then
                 U.SayHello()
                 if U.ExtensionSync then U.ExtensionSync("guild") end

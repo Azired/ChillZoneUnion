@@ -606,7 +606,7 @@ do
     expect(gm.U.Link("Нет Такого"), "offline-target setup was not started")
     Step(190)
     expect(not gm.U.Connected(), "offline target connected")
-    eq(gm.U.SetupState().state, "error", "offline-target timeout not visible")
+    eq(gm.U.SetupState().state, "expired", "offline-target timeout not visible")
 end
 print("PASS offline recipient timeout")
 do
@@ -1088,16 +1088,18 @@ for _, rank in ipairs({ 0, 1, 2 }) do
         if frame.frameType == "EditBox" and frame.width == 350 then contactBox = frame end
         if frame.text == "Подключить" then connect = frame end
     end
-    expect(searchBox.parent:IsShown() and not contactBox.parent:IsShown(), "minimap did not open the shared roster for fresh player")
+    expect(contactBox.parent:IsShown() and not searchBox.parent:IsShown(), "minimap did not open first-run connection guidance")
     b.scripts.OnClick(b, "LeftButton")
-    expect(not window:IsShown(), "second left click did not hide roster")
+    expect(not window:IsShown(), "second left click did not hide the window")
     b.scripts.OnClick(b, "RightButton")
     expect(window:IsShown() and contactBox.parent:IsShown(), "right click did not open settings")
     SetRosters(0); c.U.Refresh()
     if rank ~= 0 then expect(connect.enabled == false, "minimap button granted setup permission to ordinary player/officer") end
     window:Hide(); c.locked = true
     b.scripts.OnClick(b, "LeftButton")
-    expect(window:IsShown() and searchBox.parent:IsShown(), "chat lockdown blocked opening the roster")
+    expect(window:IsShown(), "chat lockdown blocked opening the addon")
+    c.U.OpenRoster()
+    expect(searchBox.parent:IsShown(), "explicit roster access was blocked by chat lockdown")
     c.locked = false; window:Hide()
     c.E.Minimap.effectiveScale = 2; c.cursorX, c.cursorY = 200, 600
     b.scripts.OnDragStart(b)

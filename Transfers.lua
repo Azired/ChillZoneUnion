@@ -3,6 +3,7 @@ local lastReady, lastResend = -100, -100
 local acceptRetry, receiptRetry, declineRetry = {}, {}, {}
 local RETRY_FOR, CONFIRM_FOR = 5, 180
 local syncRequest, syncReplies, syncReplyAt, syncProgress, syncPushState = nil, {}, {}, {}, {}
+local gatewayRecovery
 local syncWindow, syncCount, syncBytes = -100, 0, 0
 local SYNC_REPLY_FOR, SYNC_REPLY_LIMIT, SYNC_REPLY_BYTES = 15, 8, 4096
 function U.Tickets()
@@ -74,6 +75,15 @@ local function LiveAddonMember(name)
     local peer = U.peers[name]
     return name == U.me or (peer and U.clock() - peer.at <= 65) or false
 end
+local function RecoveryPeer(name)
+    local row = U.own[name]
+    return name ~= U.me and row and row.online and LiveAddonMember(name) and U.CanRelay(name) or false
+end
+local function ReplyAllowed(name, donor)
+    -- A backup relay can attest only to the current gateway that requested it.
+    if donor then return U.CanRelay() and name == U.GatewayName() and RecoveryPeer(name) end
+    return OwnGateway() and U.own[name] and (U.CanRelay(name) or U.CanInvite(name)) or false
+end
 function U.CreateTransfer(name, guild)
     guild = guild or U.guild
     name = U.Name(name)
@@ -122,10 +132,31 @@ local function StateProof(t, state)
     for i = 1, #fields do hash = (hash * 33 + fields:byte(i)) % 4294967291 end
     return tostring(hash)
 end
-function U.TransferSyncRequest(force)
+function U.TransferSyncRequest(force, peer)
     if not U.db or not U.guild or not U.me or not (U.CanInvite() or U.CanRelay()) then return false end
     local gateway, now = U.GatewayName(), U.clock()
-    if not gateway or gateway == U.me or not U.own[gateway] or not U.CanRelay(gateway) then return false end
+    if not gateway or not U.own[gateway] or not U.CanRelay(gateway) then return false end
+    if gateway == U.me then
+        syncRequest = nil
+        if not OwnGateway() then return false end
+        if not force and gatewayRecovery and gatewayRecovery.guild == U.guild then
+            if peer and RecoveryPeer(peer) then
+                local helloAt, previous = U.peers[peer].at, gatewayRecovery.seen[peer]
+                gatewayRecovery.seen[peer] = helloAt
+                if not previous or helloAt - previous > 65 then
+                    gatewayRecovery.peers[peer] = nil
+                    gatewayRecovery.finished[peer] = nil
+                    if gatewayRecovery.active == peer then gatewayRecovery.active = nil end
+                    gatewayRecovery.untilAt = now + CONFIRM_FOR
+                end
+            end
+            return true
+        end
+        gatewayRecovery = { guild = U.guild, untilAt = now + CONFIRM_FOR, nextAt = now, peers = {}, seen = {}, finished = {} }
+        for name, info in pairs(U.peers) do if RecoveryPeer(name) then gatewayRecovery.seen[name] = info.at end end
+        return true
+    end
+    gatewayRecovery = nil
     if not force and syncRequest and syncRequest.guild == U.guild and syncRequest.gateway == gateway then return true end
     syncRequest = { guild = U.guild, gateway = gateway, nonce = U.NewID(), untilAt = now + CONFIRM_FOR, nextAt = now }
     return true
@@ -139,9 +170,11 @@ local function SyncCandidates()
 end
 function U.TransferSyncFor(name, nonce, ack)
     name = U.Name(name)
-    if not U.db or not U.guild or not OwnGateway() or not name or name == U.me or not U.own[name]
+    if not U.db or not U.guild or not name or name == U.me or not U.own[name]
         or not (U.CanRelay(name) or U.CanInvite(name))
         or nonce ~= nil and not ValidNonce(nonce) or ack ~= nil and not ValidNonce(ack) then return false end
+    local donor = not OwnGateway()
+    if not ReplyAllowed(name, donor) or donor and nonce == nil then return false end
     -- Both requests and HELLO pushes are limited to invitation-capable clients
     -- and backup relays. Ordinary members cannot consume the reply budget.
     local _, signature = SyncCandidates()
@@ -168,9 +201,60 @@ function U.TransferSyncFor(name, nonce, ack)
         if nonce == nil then return true end
         reply.cursor = ""
     end
-    reply.nonce, reply.signature, reply.untilAt = nonce or "", signature, now + SYNC_REPLY_FOR
+    reply.nonce, reply.signature, reply.untilAt, reply.donor = nonce or "", signature, now + SYNC_REPLY_FOR, donor
     reply.cursor = progress.cursor
     return true
+end
+local function RecoveryTick(now)
+    local recovery = gatewayRecovery
+    if not recovery then return end
+    if recovery.guild ~= U.guild or not OwnGateway() then gatewayRecovery = nil; return end
+    if now >= (recovery.cleanAt or 0) then
+        for name in pairs(recovery.seen) do
+            if not U.own[name] then recovery.seen[name], recovery.finished[name], recovery.peers[name] = nil, nil, nil end
+        end
+        recovery.cleanAt = now + SYNC_REPLY_FOR
+    end
+    if now > recovery.untilAt then return end
+    local active = recovery.active and recovery.peers[recovery.active]
+    if active and (active.complete or not RecoveryPeer(recovery.active) or now >= active.slotUntil) then
+        recovery.active, active = nil, nil
+    end
+    -- END closes one donor only. Another relay can retain a later READY or an
+    -- entirely different ticket; an empty first reply cannot close the round.
+    if not active then
+        local candidates, count = {}, 0
+        for name, peer in pairs(recovery.peers) do
+            if peer.complete then
+                recovery.finished[name], recovery.peers[name] = true, nil
+            elseif not RecoveryPeer(name) then recovery.peers[name] = nil
+            else count = count + 1 end
+        end
+        for name in pairs(U.peers) do
+            local peer = recovery.peers[name]
+            if RecoveryPeer(name) and not recovery.finished[name] and (peer and not peer.complete or not peer and count < 32) then
+                candidates[#candidates + 1] = name
+            end
+        end
+        table.sort(candidates, function(a, b)
+            local aa = recovery.peers[a] and recovery.peers[a].lastTry or -100
+            local ba = recovery.peers[b] and recovery.peers[b].lastTry or -100
+            if aa ~= ba then return aa < ba end
+            return a < b
+        end)
+        local name = candidates[1]
+        if not name then return end
+        active = recovery.peers[name] or { nonce = U.NewID(), nextAt = now }
+        active.lastTry, active.slotUntil = now, now + SYNC_REPLY_FOR
+        recovery.peers[name], recovery.active = active, name
+        recovery.seen[name] = U.peers[name].at
+    end
+    if now >= recovery.nextAt and now >= active.nextAt then
+        local fields = { U.guild, recovery.active, U.me, active.nonce }
+        if active.ack then fields[5] = active.ack end
+        U.Queue("TSYNC", fields, "GUILD", nil, false, false, nil, true, now + RETRY_FOR)
+        active.nextAt, recovery.nextAt = now + RETRY_FOR, now + RETRY_FOR
+    end
 end
 local function SyncTick(now)
     if syncRequest then
@@ -187,11 +271,11 @@ local function SyncTick(now)
             syncRequest.nextAt = now + RETRY_FOR
         end
     end
-    if not OwnGateway() then syncReplies = {}; return end
+    RecoveryTick(now)
     if now - syncWindow >= 10 then syncWindow, syncCount, syncBytes = now, 0, 0 end
     local names = {}
     for name, reply in pairs(syncReplies) do
-        if reply.untilAt < now or not U.own[name] or not (U.CanRelay(name) or U.CanInvite(name)) then syncReplies[name] = nil
+        if reply.untilAt < now or not ReplyAllowed(name, reply.donor) then syncReplies[name] = nil
         elseif now >= reply.nextAt then names[#names + 1] = name end
     end
     table.sort(names, function(a, b)
@@ -223,7 +307,7 @@ local function SyncTick(now)
                 local size = #U.Pack(fields) + 7
                 if #jobs >= SYNC_REPLY_LIMIT or bytes + size > SYNC_REPLY_BYTES - 1280 then break end
                 jobs[#jobs + 1] = { kind = "TSTATE", fields = fields, dist = "GUILD", priority = false,
-                    requiresGateway = true, expiresAt = now + RETRY_FOR, cancelKey = "transfer-state:" .. t.id }
+                    requiresGateway = not reply.donor, expiresAt = now + RETRY_FOR, cancelKey = "transfer-state:" .. t.id }
                 bytes, cursor = bytes + size, t.id
                 manifest[#manifest + 1] = U.Pack({ t.id, t.acceptNonce, t.state, StateProof(t, t.state) })
             end
@@ -232,7 +316,7 @@ local function SyncTick(now)
         local token = progress.batch and progress.batch.token or U.NewID()
         local control = { U.guild, name, reply.nonce, more and "MORE" or "END", token, U.Pack(manifest) }
         jobs[#jobs + 1] = { kind = "TSTATE", fields = control,
-            dist = "GUILD", priority = false, requiresGateway = true, expiresAt = now + RETRY_FOR }
+            dist = "GUILD", priority = false, requiresGateway = not reply.donor, expiresAt = now + RETRY_FOR }
         bytes = bytes + #U.Pack(control) + 7
         if syncBytes + bytes > SYNC_REPLY_BYTES then
             reply.nextAt = syncWindow + 10
@@ -257,9 +341,21 @@ local function SyncTick(now)
 end
 local function TakeState(f, sender, remote)
     if remote or (#f ~= 13 and #f ~= 6) or tonumber(f[1]) ~= U.guild or f[2] ~= U.me or not U.own[sender]
-        or sender ~= U.GatewayName() or not U.CanRelay(sender) then return false end
-    if f[3] ~= "" and (not ValidNonce(f[3]) or not syncRequest or syncRequest.guild ~= U.guild
-        or syncRequest.gateway ~= sender or syncRequest.nonce ~= f[3] or U.clock() > syncRequest.untilAt) then return false end
+        or not U.CanRelay(sender) then return false end
+    local request
+    if sender == U.GatewayName() then
+        if f[3] ~= "" then
+            if not ValidNonce(f[3]) or not syncRequest or syncRequest.guild ~= U.guild
+                or syncRequest.gateway ~= sender or syncRequest.nonce ~= f[3] or U.clock() > syncRequest.untilAt then return false end
+            request = syncRequest
+        end
+    else
+        local recovery = gatewayRecovery
+        request = recovery and recovery.peers[sender]
+        if not OwnGateway() or not RecoveryPeer(sender) or not recovery or recovery.guild ~= U.guild
+            or recovery.active ~= sender or not request or not ValidNonce(f[3]) or request.nonce ~= f[3]
+            or U.clock() > recovery.untilAt or U.clock() >= request.slotUntil then return false end
+    end
     if #f == 6 then
         if (f[4] ~= "END" and f[4] ~= "MORE") or not ValidNonce(f[5]) then return false end
         local manifest = U.Unpack(f[6], SYNC_REPLY_LIMIT)
@@ -276,8 +372,10 @@ local function TakeState(f, sender, remote)
                 or StateProof(t, item[3]) ~= item[4]) then return false end
         end
         if f[3] ~= "" then
-            syncRequest.ack = f[5]
-            if f[4] == "END" then syncRequest.complete = true end
+            local progress = request.ack ~= f[5]
+            request.ack = f[5]
+            if f[4] == "END" then request.complete = true end
+            if progress and gatewayRecovery and gatewayRecovery.peers[sender] == request then request.slotUntil = U.clock() + SYNC_REPLY_FOR end
         end
         return true
     end
@@ -297,7 +395,8 @@ local function TakeState(f, sender, remote)
             or existing.source ~= source or existing.dest ~= dest or existing.member ~= member or existing.master ~= master
             or existing.created ~= created or (existing.authorityGuild or existing.source) ~= authority
             or existing.acceptNonce and existing.acceptNonce ~= incoming.acceptNonce then return false end
-        existing.acceptNonce, existing.receiptReady = incoming.acceptNonce, incoming.receiptReady
+        -- Receipt attestation repairs destination state, but cannot mint a TACK.
+        existing.acceptNonce, existing.receiptReady, existing.receiptSynced = incoming.acceptNonce, incoming.receiptReady, true
         if existing.state ~= "ready" then existing.state = incoming.state end
     else
         for _, other in pairs(tickets) do
@@ -306,6 +405,7 @@ local function TakeState(f, sender, remote)
                 other.state, other.confirmedNonce, other.receiptReady, other.left = "replaced", nil, nil, nil
             end
         end
+        incoming.receiptSynced = true
         tickets[incoming.id] = incoming
     end
     if U.Refresh then U.Refresh() end
@@ -387,7 +487,7 @@ function U.TransferMessage(kind, f, sender, remote, context)
         if remote then
             if t.state ~= "ready" then t.state = "accepted" end
             -- Do not acknowledge until the destination guild relay is queued.
-            if f[5] and context and OwnGateway(context) then t.receiptReady = f[5] end
+            if f[5] and context and OwnGateway(context) then t.receiptReady, t.receiptSynced = f[5], nil end
         elseif not U.TransferConfirmed(t) then
             t.state = "pending"
             t.acceptStarted = t.acceptStarted or U.stamp()
@@ -439,7 +539,7 @@ function U.TransferRelayQueued(kind, f, source)
     local t = U.Tickets()[f[2]]
     if not FieldsMatch(t, f) or not ValidTicket(t) or t.dest ~= U.guild
         or t.state ~= "accepted" or t.acceptNonce ~= f[5] or U.TrustedPeer(source) ~= t.source then return false end
-    t.receiptReady = f[5]
+    t.receiptReady, t.receiptSynced = f[5], nil
     return true
 end
 function U.AcceptTransfer(id, accept)
@@ -527,7 +627,7 @@ function U.TransferTick()
     SyncTick(now)
     if U.guild and U.IsGateway() and U.Connected() and U.remote then
         for id, t in pairs(tickets) do
-            if ValidTicket(t) and t.dest == U.guild and t.state == "accepted" and t.receiptReady == t.acceptNonce
+            if ValidTicket(t) and t.dest == U.guild and t.state == "accepted" and not t.receiptSynced and t.receiptReady == t.acceptNonce
                 and ValidNonce(t.acceptNonce) and U.TrustedPeer(U.remote.name) == t.source
                 and now >= (receiptRetry[id] or -100) then
                 if U.Queue("TACK", ConsentFields(t), "WHISPER", U.remote.name, true, false, nil, true, now + RETRY_FOR) then

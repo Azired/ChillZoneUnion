@@ -179,15 +179,56 @@ local function ReadyGroup(count)
     for _, ticket in ipairs(tickets) do eq(relay.U.Tickets()[ticket.id].state, "ready", "budget gateway missed actual READY") end
     return gm, relay, invite, tickets
 end
+local function GatewayHandoff(empty, donorRank)
+    local gm, relay, member, invite = World(true)
+    local donor = H.NewClient("ZZ Current Carrier", 2, donorRank or 1, Copy(invite.E.ChillZoneUnionDB))
+    if donorRank == 4 then donor.officer, donor.rankName, donor.invitePermission = false, relay.rankName, false end
+    Login(donor); H.Step(25)
+    local t = Proposal(gm, member)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "handoff target missed original proposal")
+    local saved = Copy(invite.E.ChillZoneUnionDB)
+    if empty then saved.realms["ForeverRealm:Alliance"].tickets = {} end
+    invite.live = false; H.SetRosters(0)
+    member.U.AcceptTransfer(t.id, true); H.Step(15)
+    eq(t.state, "accepted", "handoff member missed authenticated destination ACK")
+    member.U.LeaveForTransfer(t.id); eq(member.command, "/gquit", "handoff member could not prepare actual leave")
+    member.guild = nil; member.U.frame.scripts.OnEvent(member.U.frame, "PLAYER_GUILD_UPDATE", "player")
+    H.SetRosters(0); H.Step(12)
+    eq(donor.U.Tickets()[t.id] and donor.U.Tickets()[t.id].state, "ready", "online carrier did not observe actual ready state")
+    eq(invite.U.Tickets()[t.id].state, "proposed", "absent gateway target observed consent")
+    H.RemoveClient(invite); relay.live = false
+    local gateway = H.NewClient(invite.name, 2, 1, saved)
+    Login(gateway)
+    return gm, relay, member, gateway, donor, t
+end
+local function PendingGatewayHandoff()
+    local gm, relay, member, invite = World(true)
+    local donor = H.NewClient("ZZ Pending Carrier", 2, 1, Copy(invite.E.ChillZoneUnionDB))
+    Login(donor); H.Step(25)
+    local t = Proposal(gm, member)
+    local saved = Copy(invite.E.ChillZoneUnionDB)
+    invite.live = false; H.SetRosters(0)
+    H.SetFilter(function(packet) return not IsKind(packet, "TACK") end)
+    member.U.AcceptTransfer(t.id, true); H.Step(15)
+    eq(t.state, "pending", "missing-ACK fixture unexpectedly confirmed source consent")
+    eq(donor.U.Tickets()[t.id] and donor.U.Tickets()[t.id].state, "accepted", "pending carrier never observed real destination acceptance")
+    member.U.LeaveForTransfer(t.id); assert(not member.command, "unconfirmed fixture could prepare leave")
+    member.locked = true
+    H.RemoveClient(invite); relay.live = false
+    local gateway = H.NewClient(invite.name, 2, 1, saved)
+    Login(gateway)
+    return gm, relay, member, gateway, donor, t
+end
 local function StateFields(relay, target, t, nonce)
     return { relay.U.guild, target.name, nonce or "", t.source, t.id, t.member, t.dest,
         t.master, t.created, t.authorityGuild or t.source, t.acceptNonce or "", t.state, t.receiptReady or "" }
 end
 -- Keep live gateway advertisements while admitting only explicitly queued
 -- snapshot probes. This isolates hostile packets from automatic catch-up.
-local function StateProbe(target)
+local function StateProbe(target, observe)
     local allowed = {}
     H.SetFilter(function(packet, receiver)
+        if observe then observe(packet, receiver) end
         if receiver ~= target then return true end
         if IsKind(packet, "HELLO") then return true end
         return allowed[packet.text:match("^([^~]+)~")] == true
@@ -524,6 +565,387 @@ Scenario("returning officer catches up from replacement Veteran gateway", functi
     Login(invite); H.Step(120)
     eq(invite.U.Tickets()[t.id].state, "ready", "returning officer did not recover state from current replacement gateway")
     invite.U.InviteTransfer(t.id); eq(invite.command, "/ginvite " .. member.name, "gateway replacement blocked recovered invitation")
+end)
+
+Scenario("stale proposed officer elected gateway recovers READY from online carrier", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    H.Step(140)
+    assert(gateway.U.IsGateway(), "stale returning officer was not elected gateway")
+    eq(donor.U.GatewayName(), gateway.name, "online carrier did not observe elected replacement")
+    local later = H.NewClient("Later Handoff Officer", 2, 1)
+    Login(later); H.Step(60)
+    local state = gateway.U.Tickets()[t.id] and gateway.U.Tickets()[t.id].state or "missing"
+    local lateState = later.U.Tickets()[t.id] and later.U.Tickets()[t.id].state or "missing"
+    print("AUDIT gateway handoff: carrier=" .. donor.U.Tickets()[t.id].state .. "; elected gateway=" .. state .. "; later client=" .. lateState)
+    eq(state, "ready", "elected gateway retained stale proposed state despite online ready carrier")
+    eq(lateState, "ready", "later destination client did not learn recovered ready state")
+    gateway.U.InviteTransfer(t.id); eq(gateway.command, "/ginvite " .. member.name, "recovered gateway could not prepare invitation")
+end)
+
+Scenario("empty elected gateway recovers complete ready body without participant READY retries", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff(true)
+    local received, native = 0, gateway.U.TransferMessage
+    gateway.U.TransferMessage = function(kind, fields, sender, ...)
+        local result = native(kind, fields, sender, ...)
+        if result and kind == "TSTATE" and #fields == 13 and sender == donor.name and fields[12] == "ready" then received = received + 1 end
+        return result
+    end
+    H.SetFilter(function(packet, receiver) return receiver ~= gateway or packet.from ~= member or not IsKind(packet, "READY") end)
+    H.Step(140)
+    assert(gateway.U.IsGateway(), "empty replacement did not remain current gateway")
+    eq(gateway.U.Tickets()[t.id] and gateway.U.Tickets()[t.id].state, "ready", "empty gateway did not recover full ready ticket")
+    assert(received > 0, "gateway did not accept actual donor ready data")
+    eq(gateway.U.Tickets()[t.id].member, t.member, "recovered ticket changed member")
+    eq(gateway.U.Tickets()[t.id].master, t.master, "recovered ticket changed proposal authority")
+    eq(gateway.U.Tickets()[t.id].created, t.created, "recovered ticket changed creation time")
+    assert(not gateway.U.TransferConfirmed(gateway.U.Tickets()[t.id]) and not gateway.U.Tickets()[t.id].confirmedNonce, "donor snapshot granted source participant ACK proof")
+    gateway.U.TransferMessage = native; H.SetFilter(nil)
+end)
+
+Scenario("native Veteran carrier restores ready to newly elected officer gateway", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff(false, 4)
+    H.SetFilter(function(packet, receiver) return receiver ~= gateway or packet.from ~= member or not IsKind(packet, "READY") end)
+    assert(donor.U.CanRelay() and not donor.U.IsOfficer() and not donor.U.CanInvite(), "Veteran carrier fixture gained officer or invitation permission")
+    H.Step(140)
+    assert(gateway.U.IsGateway(), "Veteran carrier preempted elected officer")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "eligible Veteran carrier did not restore gateway state")
+    assert(not donor.command, "recovery granted Veteran protected invitation action")
+    H.SetFilter(nil)
+end)
+
+Scenario("empty first donor does not hide a second carrier with actual READY", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    local first = H.NewClient("ZA Empty Carrier", 2, 1, Copy(gateway.E.ChillZoneUnionDB))
+    local blocked, firstRequests, readyRequests = true, 0, 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if blocked and receiver == gateway and packet.from == donor and kind == "HELLO" then return false end
+        if packet.from == gateway and kind == "TSYNC" and fields then
+            if receiver == first and fields[2] == first.name then firstRequests = firstRequests + 1 end
+            if receiver == donor and fields[2] == donor.name then readyRequests = readyRequests + 1 end
+        end
+        return true
+    end)
+    Login(first); H.Step(8)
+    assert(firstRequests > 0, "empty earlier donor was not actually queried")
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "empty donor fabricated ready state")
+    blocked = false; donor.U.SayHello(); H.Step(100)
+    assert(gateway.U.IsGateway() and readyRequests > 0, "gateway did not continue from empty donor to ready carrier")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "first empty reply ended recovery before real ready carrier")
+    H.SetFilter(nil)
+end)
+
+Scenario("eligible carrier returning after initial recovery deadline starts one fresh bounded round", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    donor.live = false; H.SetRosters(0)
+    local requests = 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and receiver == donor and kind == "TSYNC" and fields and fields[2] == donor.name then requests = requests + 1 end
+        return true
+    end)
+    H.Step(220)
+    assert(gateway.U.IsGateway(), "late carrier fixture lost elected gateway")
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "absent carrier unexpectedly repaired gateway")
+    Login(donor); H.Step(90)
+    assert(requests > 0, "late eligible HELLO did not open a fresh recovery round")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "carrier returning after 180 seconds could not restore gateway")
+    local completed = requests
+    H.Step(80)
+    eq(requests, completed, "continuous carrier HELLO repeated completed gateway recovery")
+    H.SetFilter(nil)
+end)
+
+Scenario("duplicate MORE token cannot monopolize gateway recovery ahead of ready carrier", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    local first = H.NewClient("ZA Repeating Carrier", 2, 1, Copy(gateway.E.ChillZoneUnionDB))
+    local allowed, firstRequests, readyRequests, acceptedControls, hidden = {}, 0, 0, 0, true
+    local native = gateway.U.TransferMessage
+    gateway.U.TransferMessage = function(kind, fields, sender, ...)
+        local result = native(kind, fields, sender, ...)
+        if result and kind == "TSTATE" and #fields == 6 and sender == first.name and fields[4] == "MORE" then acceptedControls = acceptedControls + 1 end
+        return result
+    end
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if receiver == gateway and packet.from == donor and kind == "HELLO" and hidden then return false end
+        if packet.from == gateway and kind == "TSYNC" and fields then
+            if receiver == first and fields[2] == first.name then
+                firstRequests = firstRequests + 1
+                serial = serial + 1; allowed[tostring(serial)] = true
+                assert(first.U.Queue("TSTATE", { 2, gateway.name, fields[4], "MORE", "1.555777", "" }, "GUILD", nil, false, false, tostring(serial)))
+            elseif receiver == donor and fields[2] == donor.name then readyRequests = readyRequests + 1 end
+        end
+        if receiver == gateway and packet.from == first and kind == "TSTATE" then return allowed[packet.text:match("^([^~]+)~")] == true end
+        return true
+    end)
+    Login(first); H.Step(3)
+    assert(firstRequests > 0, "repeating donor was not actually challenged first")
+    hidden = false; donor.U.SayHello(); H.Step(30)
+    assert(acceptedControls >= 2, "fixture did not accept duplicate valid MORE controls")
+    assert(gateway.U.IsGateway() and readyRequests > 0, "duplicate MORE held active donor slot without new progress")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "duplicate MORE prevented ready carrier recovery within bounded rotation")
+    gateway.U.TransferMessage = native; H.SetFilter(nil)
+end)
+
+Scenario("thirty-two completed empty donors do not exclude a late thirty-third ready carrier", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    donor.live = false
+    local empty, names, completed, readyRequests = {}, {}, {}, 0
+    for i = 1, 32 do
+        local name = string.format("ZA Empty%02d", i)
+        empty[i] = H.NewClient(name, 2, 1, Copy(gateway.E.ChillZoneUnionDB)); names[name] = true
+    end
+    H.SetRosters(0)
+    local native = gateway.U.TransferMessage
+    gateway.U.TransferMessage = function(kind, fields, sender, ...)
+        local result = native(kind, fields, sender, ...)
+        if result and kind == "TSTATE" and #fields == 6 and fields[4] == "END" and names[sender] then completed[sender] = true end
+        return result
+    end
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and receiver == donor and kind == "TSYNC" and fields and fields[2] == donor.name then readyRequests = readyRequests + 1 end
+        return true
+    end)
+    for _, carrier in ipairs(empty) do carrier.U.frame.scripts.OnEvent(carrier.U.frame, "PLAYER_LOGIN") end
+    H.Step(210)
+    assert(gateway.U.IsGateway(), "empty carrier population changed elected gateway")
+    eq(H.Count(completed), 32, "fixture did not complete thirty-two actual donor END sessions")
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "empty donors fabricated ready state")
+    Login(donor); H.Step(90)
+    assert(readyRequests > 0, "completed donor records consumed all slots for late thirty-third carrier")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "late thirty-third ready carrier could not repair gateway")
+    gateway.U.TransferMessage = native; H.SetFilter(nil)
+end)
+
+Scenario("invitation-only ready carrier cannot attest gateway recovery", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff(false, 3)
+    donor.invitePermission, donor.officer = true, false
+    for _, c in ipairs({ gateway, donor }) do
+        local native = c.E.C_GuildInfo.GuildControlGetRankFlags
+        c.E.C_GuildInfo.GuildControlGetRankFlags = function(order)
+            local flags = native(order)
+            if order == 4 then flags[7], flags[22] = true, false end
+            return flags
+        end
+        c.U.frame.scripts.OnEvent(c.U.frame, "GUILD_RANKS_UPDATE")
+    end
+    local replies, nativeBatch = 0, donor.U.QueueBatch
+    donor.U.QueueBatch = function(items)
+        local result = nativeBatch(items)
+        if result then for _, item in ipairs(items) do
+            if item.kind == "TSTATE" and item.fields[2] == gateway.name then replies = replies + 1 end
+        end end
+        return result
+    end
+    H.SetFilter(function(packet, receiver) return receiver ~= gateway or packet.from ~= member or not IsKind(packet, "READY") end)
+    H.Step(100)
+    assert(gateway.U.IsGateway() and gateway.U.CanInvite(donor.name) and not gateway.U.CanRelay(donor.name), "invitation-only carrier native authority fixture is invalid")
+    assert(gateway.U.Queue("TSYNC", { 2, donor.name, gateway.name, gateway.U.NewID() }, "GUILD", nil, false))
+    H.Step(25)
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "invitation-only carrier upgraded elected gateway without relay authority")
+    eq(replies, 0, "invitation-only carrier emitted a gateway attestation")
+    donor.U.QueueBatch = nativeBatch; H.SetFilter(nil)
+end)
+
+Scenario("challenged donor recovery rejects forged senders nonce identity and terminal state", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff(false, 4)
+    local ordinary = H.NewClient("Ordinary Handoff Forger", 2, 2)
+    H.SetRosters(0)
+    local nonce
+    local send = StateProbe(gateway, function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if packet.from == gateway and receiver == donor and kind == "TSYNC" and fields and fields[2] == donor.name then nonce = fields[4] end
+    end)
+    donor.U.SayHello(); H.Step(5)
+    assert(gateway.U.IsGateway() and nonce, "gateway did not challenge eligible native donor")
+    local original = Copy(gateway.U.Tickets()[t.id])
+    local function Fields() return StateFields(donor, gateway, donor.U.Tickets()[t.id], assert(nonce)) end
+    local unsolicited = Fields(); unsolicited[3] = ""
+    eq(send(donor, unsolicited), false, "unsolicited donor push upgraded elected gateway")
+    local wrong = Fields(); wrong[3] = wrong[3] .. ".99"
+    eq(send(donor, wrong), false, "wrong donor challenge nonce upgraded gateway")
+    local oldNonce = nonce
+    assert(gateway.U.TransferSyncRequest(true)); H.Step(2)
+    assert(nonce ~= oldNonce, "new recovery round reused old donor nonce")
+    local replay = Fields(); replay[3] = oldNonce
+    eq(send(donor, replay), false, "old recovery round replay upgraded gateway")
+    send(ordinary, Fields())
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "ordinary guild member forged challenged donor state")
+    send(gm, Fields(), "WHISPER")
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "foreign gateway forged own-guild donor state")
+    for _, state in ipairs({ "declined", "done", "replaced" }) do
+        gateway.U.Tickets()[t.id] = Copy(original); gateway.U.Tickets()[t.id].state = state
+        eq(send(donor, Fields()), false, "donor snapshot reopened terminal " .. state .. " ticket")
+        eq(gateway.U.Tickets()[t.id].state, state, "terminal state changed after donor rejection")
+    end
+    gateway.U.Tickets()[t.id] = Copy(original)
+    local newer = Copy(original); newer.id = t.id .. ".99"; newer.created = newer.created + 1
+    gateway.U.Tickets()[newer.id] = newer
+    eq(send(donor, Fields()), false, "donor snapshot revived superseded proposal")
+    gateway.U.Tickets()[newer.id] = nil
+    gateway.U.Tickets()[t.id] = Copy(original)
+    gateway.U.Tickets()[t.id].created = gateway.U.stamp() - 1801
+    local expired = Fields(); expired[9] = gateway.U.Tickets()[t.id].created
+    eq(send(donor, expired), false, "donor handler accepted expired ticket before cleanup")
+    gateway.U.Tickets()[t.id] = Copy(original)
+    for _, change in ipairs({ { 4, 2 }, { 6, "Different Handoff Member" }, { 7, 1 },
+        { 8, "Different Handoff Master" }, { 9, t.created + 1 }, { 10, 2 }, { 13, "1.888" } }) do
+        local fields = Fields(); fields[change[1]] = change[2]
+        eq(send(donor, fields), false, "donor snapshot accepted conflicting field " .. change[1])
+        eq(gateway.U.Tickets()[t.id].state, "proposed", "conflicting donor body changed ticket")
+    end
+    gateway.U.Tickets()[t.id].acceptNonce = "1.999"
+    eq(send(donor, Fields()), false, "donor snapshot rewrote existing consent nonce")
+    gateway.U.Tickets()[t.id].acceptNonce = nil
+    donor.rankName = "Member"; H.SetRosters(0); H.Step(1)
+    assert(gateway.U.IsGateway() and not gateway.U.CanRelay(donor.name), "native donor revocation also invalidated receiving gateway")
+    send(donor, Fields())
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "revoked native donor upgraded gateway")
+    donor.rankName = oldGateway.rankName; H.SetRosters(0)
+    assert(gateway.U.TransferSyncRequest(true)); H.Step(2)
+    eq(send(donor, Fields()), true, "valid active donor could not recover after rejection probes")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "valid donor did not restore ready state")
+    assert(gateway.U.IsGateway() and not gateway.U.Tickets()[t.id].confirmedNonce, "recovery altered elected authority or created source consent proof")
+    H.SetFilter(nil)
+end)
+
+Scenario("gateway donor recovery retries full queues and lost data with delivered completion", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    local requests, data, droppedRequest, droppedData, refused = 0, 0, 0, 0, 0
+    local nativeBatch = donor.U.QueueBatch
+    donor.U.QueueBatch = function(items)
+        local result = nativeBatch(items)
+        if not result then for _, item in ipairs(items) do
+            if item.kind == "TSTATE" and item.fields[2] == gateway.name then refused = refused + 1; break end
+        end end
+        return result
+    end
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and receiver == donor and kind == "TSYNC" and fields and fields[2] == donor.name then
+            requests = requests + 1
+            if droppedRequest == 0 then droppedRequest = 1; return false end
+        end
+        if packet.from == donor and receiver == gateway and kind == "TSTATE" and fields and #fields == 13 then
+            data = data + 1
+            if droppedData == 0 then droppedData = 1; return false end
+        end
+        return true
+    end)
+    donor.U.SayHello(); H.Step(3)
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "discovery fixture bypassed dropped initial request")
+    gateway.U.ClearQueue(); donor.U.ClearQueue()
+    gateway.locked, donor.locked = true, true
+    for i = 1, 1500 do
+        assert(gateway.U.Queue("TEST", { "x" }, "GUILD", nil, false))
+        assert(donor.U.Queue("TEST", { "x" }, "GUILD", nil, false))
+    end
+    H.Step(8)
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "full requesting gateway unexpectedly received state")
+    gateway.U.ClearQueue(); gateway.locked = false; gateway.U.SayHello()
+    H.Step(12)
+    assert(refused > 0, "full donor queue never refused a real response admission")
+    donor.U.ClearQueue(); donor.locked = false
+    H.Step(120, true)
+    assert(gateway.U.IsGateway(), "queue/loss recovery changed elected gateway")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "gateway donor recovery did not survive queue refusal and data loss")
+    eq(droppedRequest, 1, "fixture did not drop actual donor request")
+    eq(droppedData, 1, "fixture did not drop actual donor data while passing control")
+    assert(requests >= 2 and data >= 2, "donor recovery did not retry both request and incomplete batch")
+    donor.U.QueueBatch = nativeBatch; H.SetFilter(nil)
+end)
+
+Scenario("unanswered gateway recovery stops after deadline while native and ordinary chat deliver", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    local requests, replies, lastNonce, bytes, maximum = 0, 0, nil, {}, 0
+    local nativeBatch, syncTick = donor.U.QueueBatch, Upvalue(donor.U.TransferTick, "SyncTick")
+    donor.U.QueueBatch = function(items)
+        local result = nativeBatch(items)
+        if result then for _, item in ipairs(items) do if item.kind == "TSTATE" then
+            assert(item.priority ~= true, "donor recovery response occupied urgent chat queue")
+            local window = Upvalue(syncTick, "syncWindow")
+            bytes[window] = (bytes[window] or 0) + #("TSTATE~" .. donor.U.Pack(item.fields))
+            maximum = math.max(maximum, bytes[window])
+            assert(bytes[window] <= 4096, "donor records and control exceeded shared reply byte window")
+        end end end
+        return result
+    end
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and receiver == donor and kind == "TSYNC" and fields and fields[2] == donor.name then
+            requests, lastNonce = requests + 1, fields[4]
+        end
+        if packet.from == donor and receiver == gateway and kind == "TSTATE" then replies = replies + 1; return false end
+        return true
+    end)
+    H.Step(100)
+    assert(gateway.U.IsGateway() and gateway.U.Connected(), "bounded recovery fixture did not retain a connected elected gateway")
+    local nativeText, queuedText = "native chat during donor retry", "ordinary chat during donor retry"
+    gateway.U.frame.scripts.OnEvent(gateway.U.frame, "CHAT_MSG_GUILD", nativeText, gateway.name .. "-ForeverRealm")
+    assert(gateway.U.Queue("CHAT", { 2, gateway.name, queuedText, "2:audit:donor-chat", gateway.U.stamp() }, "GUILD", nil, false, true))
+    H.Step(10)
+    eq(Has(gm, nativeText), 1, "native guild chat was lost while donor recovery retried")
+    eq(Has(donor, queuedText), 1, "ordinary chat queue was starved by donor recovery")
+    H.Step(100)
+    assert(requests >= 2 and requests <= 45 and replies > 0, "unanswered recovery retry count was absent or unbounded: " .. requests)
+    local completed = requests
+    H.Step(60)
+    eq(requests, completed, "HELLO heartbeats restarted expired gateway recovery")
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "discarded donor data upgraded gateway")
+    assert(gateway.U.QueueSize() < 100 and donor.U.QueueSize() < 100, "expired recovery retained growing background queues")
+    donor.U.QueueBatch = nativeBatch
+    local send = StateProbe(gateway)
+    eq(send(donor, StateFields(donor, gateway, donor.U.Tickets()[t.id], lastNonce)), false, "late donor reply bypassed expired recovery deadline")
+    print("AUDIT donor retry: requests=" .. requests .. "; max reply window=" .. maximum)
+    H.SetFilter(nil)
+end)
+
+Scenario("imported acceptance cannot synthesize source ACK after tick restart or another recovery", function()
+    local gm, oldGateway, member, gateway, donor, t = PendingGatewayHandoff()
+    local tacks, imports = 0, 0
+    local function Watch(c)
+        local native = c.U.TransferMessage
+        c.U.TransferMessage = function(kind, fields, sender, ...)
+            local result = native(kind, fields, sender, ...)
+            if result and kind == "TSTATE" and #fields == 13 and fields[5] == t.id then imports = imports + 1 end
+            return result
+        end
+    end
+    Watch(gateway)
+    H.SetFilter(function(packet)
+        local kind = WireMessage(packet)
+        if packet.from.name == gateway.name and kind == "TACK" then tacks = tacks + 1 end
+        if kind == "ACCEPT" and packet.dist == "WHISPER" then return false end
+        return true
+    end)
+    H.Step(75)
+    assert(gateway.U.IsGateway() and gateway.U.Connected() and imports > 0, "pending source fixture never imported destination acceptance")
+    local accepted = gateway.U.Tickets()[t.id]
+    eq(accepted and accepted.state, "accepted", "gateway did not recover accepted destination state")
+    eq(accepted.receiptSynced, true, "snapshot import omitted persistent no-ACK marker")
+    eq(tacks, 0, "imported acceptance generated source TACK during normal ticks")
+    eq(t.state, "pending", "imported destination state confirmed source member")
+    local saved, gatewayName = Copy(gateway.E.ChillZoneUnionDB), gateway.name
+    H.RemoveClient(gateway)
+    gateway = H.NewClient(gatewayName, 2, 1, saved)
+    Watch(gateway); Login(gateway); H.Step(25)
+    eq(gateway.U.Tickets()[t.id].receiptSynced, true, "cold restart removed snapshot no-ACK marker")
+    local before = imports
+    assert(gateway.U.TransferSyncRequest(true)); H.Step(20)
+    assert(imports > before, "restart fixture did not exercise a second donor import")
+    eq(tacks, 0, "snapshot restart or re-import synthesized source TACK")
+    eq(t.state, "pending", "snapshot restart or re-import confirmed source consent")
+    assert(not member.U.TransferConfirmed(t) and not t.confirmedNonce, "snapshot granted source ACK proof")
+    member.U.LeaveForTransfer(t.id); assert(not member.command, "recovered snapshot enabled unconfirmed source member to leave")
+    H.SetFilter(nil)
 end)
 
 Scenario("lost state request and reply retry over GUILD with duplicate delivery", function()

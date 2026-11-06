@@ -5,7 +5,7 @@ staging=$(mktemp -d)
 trap 'rm -f "$staging/ChillZoneUnion"; rmdir "$staging"' EXIT HUP INT TERM
 ln -s "$repo" "$staging/ChillZoneUnion"
 cd "$staging"
-if [ "$#" -eq 0 ]; then set -- simulation security audit; fi
+if [ "$#" -eq 0 ]; then set -- simulation security audit onboarding; fi
 for suite in "$@"; do
     if [ ! -f "ChillZoneUnion/Tests/$suite.lua" ]; then
         echo "Required test suite is missing: Tests/$suite.lua" >&2
