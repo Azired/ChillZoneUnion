@@ -507,7 +507,7 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" then fields[frame.width] = frame end
     end
-    local search, chat, contact, announcement = fields[280], fields[780], fields[350], fields[328]
+    local search, chat, contact, announcement = c.E.ChillZoneUnionWindow.czuRosterSearch, fields[780], fields[350], fields[328]
     expect(search and chat and contact and announcement, "page inputs missing from focus regression")
     c.U.OpenRoster(); search:SetText("draft filter"); search:SetFocus()
     c.U.OpenChat(); expect(not search:HasFocus(), "roster input kept keyboard focus after switching to chat")
@@ -1108,7 +1108,7 @@ for _, rank in ipairs({ 0, 1, 2 }) do
     c.U.Connected = oldConnected; c.U.Refresh(); ExpectStatus(0.7, 0.72, 0.76)
     local searchBox, contactBox, connect
     for _, frame in ipairs(c.allFrames) do
-        if frame.frameType == "EditBox" and frame.width == 280 then searchBox = frame end
+        if frame.czuRosterSearch == true then searchBox = frame end
         if frame.frameType == "EditBox" and frame.width == 350 then contactBox = frame end
         if frame.text == "Подключить" then connect = frame end
     end
@@ -1831,7 +1831,7 @@ print("PASS native world map fallback, localized/ambiguous lookup, aggregate cen
 local function RosterControls(c)
     local search, offline, filter, clear
     for _, frame in ipairs(c.allFrames) do
-        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.czuRosterSearch == true then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
         if frame.czuChoiceKey == "roster-scope" then filter = frame end
         if frame.czuLocationClear then clear = frame end
@@ -2198,7 +2198,7 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.sortTitle == "Класс" then classHeader = frame end
         if frame.sortTitle == "Имя" then nameHeader = frame end
-        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.czuRosterSearch == true then search = frame end
     end
     expect(classHeader and nameHeader and classHeader ~= nameHeader, "roster needs independent name and class sort controls")
     eq(classHeader:GetText(), "Класс", "class header label is not explicit")
@@ -2288,7 +2288,7 @@ do
     c.U.OpenRoster()
     local search, offline, guildFilter, openStats, back
     for _, frame in ipairs(c.allFrames) do
-        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.czuRosterSearch == true then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
         if frame.czuChoiceKey == "roster-scope" then guildFilter = frame end
         if frame.text == "Статистика" then openStats = frame end
@@ -2341,7 +2341,7 @@ do
     c.U.OpenRoster()
     local search, offline, guildFilter, statistics, toLevels, classBack
     for _, frame in ipairs(c.allFrames) do
-        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.czuRosterSearch == true then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
         if frame.czuChoiceKey == "roster-scope" then guildFilter = frame end
         if frame.text == "Статистика" then statistics = frame end
@@ -2532,7 +2532,7 @@ do
     for _, line in ipairs(c.E.GameTooltip.lines) do expect(not c.U.Fold(line[1]):find("нет аддона", 1, true), "unknown presence was described as no addon") end
     unknown.scripts.OnLeave(unknown)
     local search
-    for _, frame in ipairs(c.allFrames) do if frame.frameType == "EditBox" and frame.width == 280 then search = frame end end
+    for _, frame in ipairs(c.allFrames) do if frame.czuRosterSearch == true then search = frame end end
     search:SetText("Маг Навсегда"); search.scripts.OnTextChanged(search, true)
     local reused = RosterRow("Маг Навсегда"); reused.scripts.OnEnter(reused)
     expect(HasTooltipLine("ChillZoneUnion: 0.4.4-next"), "known row tooltip fixture did not show version")
@@ -2906,7 +2906,7 @@ do
     local target = FindRosterButton(owner, member.name, 2)
     local roster, search, guildFilter, offline, sortHeader, close = target.parent
     for _, frame in ipairs(owner.allFrames) do
-        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.czuRosterSearch == true then search = frame end
         if frame.czuChoiceKey == "roster-scope" then guildFilter = frame end
         if frame.frameType == "CheckButton" and frame.parent == roster then offline = frame end
         if frame.sortTitle == "Имя" then sortHeader = frame end

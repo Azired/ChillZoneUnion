@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends lua5.1
-      - name: Run simulation, security, audit, onboarding and selector regressions
+      - name: Run all seven Lua regression suites
         shell: bash
         run: |
           set -euo pipefail

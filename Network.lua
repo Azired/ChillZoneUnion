@@ -891,6 +891,10 @@ function U.HandleRemote(kind, f, source, direct, context)
     local guild = U.TrustedPeer(source)
     if not guild then return false end
     if kind == "ADDONS" then return U.PresenceMessage and U.PresenceMessage(kind, f, source, true) == true or false end
+    if kind == "ACTIVITY" then
+        if tonumber(f[1]) ~= guild or not U.TakeActivity then return false end
+        return U.TakeActivity(f, source)
+    end
     if kind == "ROSTER" then
         if tonumber(f[1]) ~= guild then return false end
         return U.TakeRoster(f, source)
@@ -1035,7 +1039,7 @@ function U.Handle(kind, f, dist, sender, id)
         local key = sender .. ":" .. id
         if remoteSeen[key] then return end
         if U.HandleRemote(kind, f, sender, true) then
-            local priority = kind ~= "ROSTER" and kind ~= "DELTA" and kind ~= "HREC" and kind ~= "ADDONS"
+            local priority = kind ~= "ROSTER" and kind ~= "DELTA" and kind ~= "ACTIVITY" and kind ~= "HREC" and kind ~= "ADDONS"
             -- Direct CHAT already committed its REMOTE+ACK atomically above.
             local queued = kind == "CHAT" or U.Queue("REMOTE", { kind, U.Pack(f), sender }, "GUILD", nil, priority, IsTextKind(kind), nil, true,
                 kind == "HREC" and U.clock() + OUTBOX_FOR or nil)

@@ -232,6 +232,40 @@ end
 function Native.GuildChoices()
     return { { value = 0, text = "Весь союз" }, { value = 1, text = U.GUILDS[1] }, { value = 2, text = U.GUILDS[2] } }
 end
+Native.activity = { days = 0 }
+function Native.Activity(row)
+    return U.ActivityInfo and U.ActivityInfo(row) or { known = false, online = false, fresh = false, label = "Нет данных" }
+end
+function Native.ActivityLabel(info)
+    local text = "Нет данных"
+    if info.online then text = info.fresh and "В сети" or "Был в сети"
+    elseif info.known and U.Text(info.label, 160) then
+        text = info.label
+        if U.Fold(text) == "сейчас" then text = "Недавно"
+        elseif not text:find("назад", 1, true) then text = text .. " назад" end
+    end
+    if not info.fresh and type(info.sourceAt) == "number" then text = text .. " *" end
+    return text
+end
+function Native.ActivityOrder(info)
+    if not info.known or type(info.sourceAt) ~= "number" then return nil end
+    if info.online and info.fresh then return info.sourceAt end
+    if type(info.minDays) == "number" then return info.sourceAt - info.minDays * 86400 end
+end
+function Native.ActivityChoices()
+    return { { value = 0, text = "Все участники" }, { value = 7, text = "Не заходили 7 дней" },
+        { value = 14, text = "Не заходили 14 дней" }, { value = 30, text = "Не заходили 30 дней" } }
+end
+function Native.RefreshActivityFilter()
+    if not Native.activity.note then return end
+    local active = Native.activity.days > 0
+    if active then offline:SetChecked(true); offline:Disable() else offline:Enable() end
+    Native.RefreshChoice(U.choiceButtons["roster-activity"])
+    Native.activity.note:SetShown(active or Overview.location == nil)
+    Native.activity.note:SetText(active
+        and ("Не заходили не менее " .. Native.activity.days .. " дней. Офлайн включён; неизвестные и устаревшие сведения не учитываются.")
+        or "* — сохранённые сведения. Наведите на участника, чтобы узнать подробности последнего входа.")
+end
 function Native.ChatChoices()
     local entries, present = { { value = false, text = "Автоматически" } }, false
     local saved = U.db.chatFrameName
@@ -351,6 +385,17 @@ local function ShowRosterTooltip(button)
     GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
     GameTooltip:SetText(U.SafeDisplay(row.name), 1, 1, 1)
     GameTooltip:AddLine(U.SafeDisplay(U.GUILDS[row.guild]), 0.72, 0.77, 0.82)
+    local class = U.ClassInfo(row.class)
+    GameTooltip:AddLine("Класс: " .. U.SafeDisplay(class.label), 0.8, 0.85, 0.9)
+    GameTooltip:AddLine("Локация: " .. U.SafeDisplay(row.zone or "неизвестна"), 0.8, 0.85, 0.9, true)
+    GameTooltip:AddLine("Звание: " .. U.SafeDisplay(row.rankName or "неизвестно"), 0.8, 0.85, 0.9, true)
+    local activity = Native.Activity(row)
+    GameTooltip:AddLine("Последний вход: " .. U.SafeDisplay(Native.ActivityLabel(activity)), 1, 0.82, 0, true)
+    if U.Text(activity.details, 1500) then GameTooltip:AddLine(U.SafeDisplay(activity.details), 0.8, 0.85, 0.9, true) end
+    if type(activity.sourceAt) == "number" then
+        GameTooltip:AddLine((activity.fresh and "Сведения обновлены: " or "Сохранено: ") .. Age(activity.sourceAt), 0.65, 0.7, 0.75)
+    end
+    if not activity.fresh then GameTooltip:AddLine("Текущий вход не подтверждён свежими данными.", 0.65, 0.7, 0.75, true) end
     if info.known == true then
         local version = U.Text(info.version, 40) and info.version or "версия неизвестна"
         GameTooltip:AddLine("ChillZoneUnion: " .. U.SafeDisplay(version), 0.85, 0.9, 0.95)
@@ -592,7 +637,11 @@ end
 
 RenderRoster = function()
     if not window then return end
-    local all, summary, fresh = {}, {}, {}
+    local all, summary, fresh, activity = {}, {}, {}, {}
+    local function Activity(row)
+        if not activity[row] then activity[row] = Native.Activity(row) end
+        return activity[row]
+    end
     local classes = {}
     local function Class(row)
         local token = type(row.class) == "string" and row.class or ""
@@ -619,7 +668,8 @@ RenderRoster = function()
             local locationMatches = not location or (fresh[guild] and row.online == true
                 and (location.unknown and zone == "" or not location.unknown and U.Fold(zone) == location.key))
             if (guildFilter == 0 or guildFilter == guild) and (offline:GetChecked() or not fresh[guild] or row.online)
-                and locationMatches and (needle == "" or text:find(needle, 1, true)) then all[#all + 1] = row end
+                and locationMatches and (needle == "" or text:find(needle, 1, true))
+                and (Native.activity.days == 0 or U.MatchesInactivity and U.MatchesInactivity(row, Native.activity.days)) then all[#all + 1] = row end
         end
         memberTotal, onlineTotal = memberTotal + total, onlineTotal + online
         if not fresh[guild] then unknownOnline = true; if known then cached = true end end
@@ -658,6 +708,11 @@ RenderRoster = function()
             local bg, bz = LocationKey(b)
             if ag ~= bg then return Before(ag, bg) end
             if az ~= bz then return Before(az, bz) end
+        elseif sortKey == "lastSeen" then
+            local aa, ba = Activity(a), Activity(b)
+            local av, bv = Native.ActivityOrder(aa), Native.ActivityOrder(ba)
+            if (av ~= nil) ~= (bv ~= nil) then return av ~= nil end
+            if av ~= nil and bv ~= nil and av ~= bv then return Before(av, bv) end
         elseif sortKey == "name" then
             if an ~= bn then return Before(an, bn) end
         else
@@ -692,6 +747,11 @@ RenderRoster = function()
             b.level:SetText(tostring(row.level))
             b.zone:SetText(fresh[row.guild] and U.SafeDisplay(row.online and row.zone or "Не в сети") or "Нет свежих данных")
             b.rank:SetText(U.SafeDisplay(row.rankName))
+            local lastLogin = Activity(row)
+            b.activity:SetText(U.SafeDisplay(Native.ActivityLabel(lastLogin)))
+            if lastLogin.online and lastLogin.fresh then b.activity:SetTextColor(0.45, 0.85, 0.57)
+            elseif lastLogin.known and lastLogin.fresh then b.activity:SetTextColor(0.85, 0.87, 0.9)
+            else b.activity:SetTextColor(0.6, 0.65, 0.68) end
             b.bg:SetColorTexture(0.12, 0.32, 0.62, selected and selected.name == row.name and selected.guild == row.guild and 0.45 or 0)
             if b.czuHovered then hovered = b end
         else
@@ -700,6 +760,7 @@ RenderRoster = function()
         end
     end
     pages.roster.range:SetText((#all > 0 and (offset + 1) or 0) .. "–" .. math.min(offset + #rows, #all) .. " из " .. #all)
+    Native.activity.empty:SetShown(Native.activity.days > 0 and #all == 0)
     pages.roster.selection:SetText(selected and ("Выбран: " .. U.SafeDisplay(selected.name) .. " — «" .. U.GUILDS[selected.guild] .. "»") or "Выберите участника для шёпота, приглашения в группу или предложения перехода.")
     Enable(pages.roster.move, selected and selected.rank ~= 0 and selected.name ~= U.me
         and ((selected.guild == U.guild and U.IsMaster()) or (selected.guild ~= U.guild and U.IsUnionLeader())))
@@ -968,11 +1029,13 @@ function Native.RefreshLocationFilter()
     if location then
         Overview.filterButton:SetText((location.unknown and "Локация не указана" or ("Локация: " .. U.SafeDisplay(location.name))) .. " — сбросить")
     end
+    Native.RefreshActivityFilter()
 end
 function Native.BuildLocationFilter(parent)
     Overview.filterButton = Button(parent, "", 0, -482, 530, function() Native.ClearLocationFilter(true) end)
     Overview.filterButton.czuLocationClear = true
     Overview.filterNote = Label(parent, "Только участники онлайн со свежими данными.", 545, -488, 405, "GameFontHighlightSmall")
+    Native.activity.note = Label(parent, "", 0, -488, 950, "GameFontHighlightSmall")
     Native.RefreshLocationFilter()
 end
 function Native.OverviewCount(zone)
@@ -1376,16 +1439,30 @@ Build = function()
     local r = pages.roster
     counts = Label(r, "", 0, 0, 950, "GameFontNormalLarge")
     guildCounts = Label(r, "", 0, -21, 950, "GameFontHighlightSmall")
-    search = Edit(r, 7, -60, 280, "Имя, класс, звание или локация")
+    search = Edit(r, 7, -60, 220, "Имя, класс, звание или локация")
+    search.czuRosterSearch = true; window.czuRosterSearch = search
     search:SetScript("OnTextChanged", function() U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster() end)
-    guildButton = Native.Choice(r, "roster-scope", "Весь союз", 310, -61, 180, Native.GuildChoices,
+    guildButton = Native.Choice(r, "roster-scope", "Весь союз", 240, -61, 165, Native.GuildChoices,
         function() return guildFilter end,
         function(value) guildFilter, offset, selected = value, 0, nil; RenderRoster() end)
-    offline = CreateFrame("CheckButton", nil, r, "UICheckButtonTemplate"); offline:SetSize(24, 24); offline:SetPoint("TOPLEFT", 510, -60)
-    Label(r, "Показывать офлайн", 538, -67, 160, "GameFontHighlightSmall")
-    offline:SetScript("OnClick", function() U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster() end)
-    Button(r, "Обновить", 820, -61, 130, function() U.RequestRoster(); U.snapshotDue = 0 end)
-    Native.Choice(r, "roster-statistics", "Статистика", 705, -61, 105,
+    Label(r, "Гильдия", 240, -38, 165, "GameFontNormalSmall")
+    Native.Choice(r, "roster-activity", "Все участники", 415, -61, 190, Native.ActivityChoices,
+        function() return Native.activity.days end,
+        function(value)
+            Native.activity.days, offset, selected = value, 0, nil
+            if value > 0 then offline:SetChecked(true); Native.ClearLocationFilter() end
+            RenderRoster()
+        end)
+    Label(r, "Неактивность", 415, -38, 190, "GameFontNormalSmall")
+    offline = CreateFrame("CheckButton", nil, r, "UICheckButtonTemplate"); offline:SetSize(24, 24); offline:SetPoint("TOPLEFT", 615, -60)
+    offline.czuRosterOffline = true; window.czuRosterOffline = offline
+    Label(r, "Показывать офлайн", 643, -67, 100, "GameFontHighlightSmall")
+    offline:SetScript("OnClick", function(self)
+        if Native.activity.days > 0 then self:SetChecked(true); return end
+        U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster()
+    end)
+    Button(r, "Обновить", 865, -61, 85, function() U.RequestRoster(); U.snapshotDue = 0 end)
+    Native.Choice(r, "roster-statistics", "Статистика", 750, -61, 105,
         function() return { { value = "classes", text = "По классам" }, { value = "levels", text = "По уровням" } } end,
         nil, function(value) if value == "classes" then U.OpenClassStats() else U.OpenLevelStats() end end, true)
     Native.Inset(r, -8, -94, 966, 320)
@@ -1405,6 +1482,7 @@ Build = function()
         b:SetScript("OnEnter", function() label:SetTextColor(1, 1, 1) end)
         b:SetScript("OnLeave", function() label:SetTextColor(1, 0.82, 0) end)
         b:SetScript("OnClick", function()
+            U.CloseChoiceMenu()
             U.CloseRosterContextMenu()
             if sortKey == key then sortDirection = -sortDirection
             else sortKey, sortDirection = key, key == "level" and -1 or 1 end
@@ -1412,20 +1490,27 @@ Build = function()
         end)
         return b
     end
-    SortHeader("name", "Имя", 4, 225)
-    SortHeader("class", "Класс", 235, 110)
-    SortHeader("level", "Ур.", 355, 45)
-    SortHeader("zone", "Локация", 410, 180)
-    SortHeader("rank", "Звание", 600, 165)
-    Label(r, "Гильдия", 775, -107, 170, "GameFontNormalSmall")
+    SortHeader("name", "Имя", 4, 201)
+    SortHeader("class", "Класс", 215, 85)
+    SortHeader("level", "Ур.", 310, 32)
+    SortHeader("zone", "Локация", 350, 145)
+    SortHeader("rank", "Звание", 505, 110)
+    Label(r, "Гильдия", 625, -107, 150, "GameFontNormalSmall")
+    SortHeader("lastSeen", "Последний вход", 785, 160)
+    Native.activity.empty = Label(r, "Нет участников с подтверждённой неактивностью.\nОбновите состав или выберите «Все участники»; неизвестные и устаревшие данные в фильтр не включаются.", 12, -146, 925, "GameFontHighlightSmall")
+    Native.activity.empty:SetHeight(40); Native.activity.empty:SetJustifyV("TOP"); Native.activity.empty:Hide()
     for i = 1, 11 do
         local b = CreateFrame("Button", nil, r); b:SetSize(950, 24); b:SetPoint("TOPLEFT", 0, -128 - (i - 1) * 25)
         Native.RowArt(b, i)
         b.addonBadge = Label(b, "CZ", 5, -6, 20, "GameFontNormalSmall"); b.addonBadge:Hide()
-        b.name = Label(b, "", 29, -5, 196); b.classText = Label(b, "", 235, -6, 110, "GameFontHighlightSmall")
-        b.level = Label(b, "", 365, -5, 35)
-        b.zone = Label(b, "", 410, -5, 180, "GameFontHighlightSmall"); b.rank = Label(b, "", 600, -5, 165, "GameFontHighlightSmall")
-        b.guild = Label(b, "", 775, -5, 170, "GameFontHighlightSmall")
+        b.name = Label(b, "", 29, -5, 176); b.classText = Label(b, "", 215, -6, 85, "GameFontHighlightSmall")
+        b.level = Label(b, "", 310, -5, 32)
+        b.zone = Label(b, "", 350, -5, 145, "GameFontHighlightSmall"); b.rank = Label(b, "", 505, -5, 110, "GameFontHighlightSmall")
+        b.guild = Label(b, "", 625, -5, 150, "GameFontHighlightSmall")
+        b.activity = Label(b, "", 785, -5, 160, "GameFontHighlightSmall")
+        for _, label in ipairs({ b.name, b.classText, b.level, b.zone, b.rank, b.guild, b.activity }) do
+            label:SetHeight(16); label:SetWordWrap(false)
+        end
         b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         b:SetScript("OnClick", U.RosterRowClick)
         b:SetScript("OnDoubleClick", U.RosterRowDoubleClick)
@@ -1634,6 +1719,7 @@ function U.OpenLocationRoster(name, scope)
     if not window then Build() end
     local label = name and U.Trim(name) or ""
     if scope ~= 1 and scope ~= 2 then scope = 0 end
+    Native.activity.days = 0
     search:SetText(""); offline:SetChecked(false)
     guildFilter, offset, selected = scope, 0, nil
     Native.RefreshChoice(guildButton)

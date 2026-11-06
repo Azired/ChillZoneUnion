@@ -27,7 +27,7 @@ function U.Unpack(s, maxFields)
     return out
 end
 
-local queues = { {}, {} }
+local queues = { {}, {}, {} }
 local buffers, seen, lastSend = {}, {}, -100
 local perSender, retryAt = {}, 0
 local bufferSenders, bufferCount, bufferBytes = {}, 0, 0
@@ -61,15 +61,20 @@ local function BufferRoom(privileged)
     return true
 end
 U.queueStats = { sent = 0, failed = 0, received = 0, dropped = 0 }
-function U.QueueSize() return #queues[1] + #queues[2] end
+function U.ForegroundQueueSize() return #queues[1] + #queues[2] end
+function U.QueueSize() return U.ForegroundQueueSize() + #queues[3] end
 function U.ClearQueue()
-    queues = { {}, {} }; buffers = {}; seen = {}; perSender = {}
+    queues = { {}, {}, {} }; buffers = {}; seen = {}; perSender = {}
     bufferSenders, bufferCount, bufferBytes = {}, 0, 0
 end
 local function Plan(kind, fields, dist, target, priority, logged, fixedID, requiresGateway, expiresAt, cancelKey)
     if not U.guild and kind ~= "READY" then return nil end
     if dist ~= "GUILD" and dist ~= "WHISPER" then return nil end
     if dist == "WHISPER" and not U.Name(target) then return nil end
+    -- Optional activity metadata must yield to roster deltas as well as chat
+    -- and control traffic, including when forwarded to the receiving guild.
+    local background = kind == "ACTIVITY" or kind == "REMOTE" and fields[1] == "ACTIVITY"
+    local tier = background and 3 or priority and 1 or 2
     local raw = kind .. "~" .. U.Pack(fields)
     local encoded = "R" .. raw
     -- Player-written chat remains plaintext for the logged messaging API.
@@ -99,7 +104,7 @@ local function Plan(kind, fields, dist, target, priority, logged, fixedID, requi
     for i = 1, count do
         jobs[#jobs + 1] = { text = id .. "~" .. i .. "~" .. count .. "~" .. pieces[i],
             dist = dist, target = target, logged = logged, tries = 0,
-            priority = priority and 1 or 2, requiresGateway = requiresGateway, expiresAt = expiresAt, cancelKey = cancelKey,
+            priority = tier, requiresGateway = requiresGateway, expiresAt = expiresAt, cancelKey = cancelKey,
             requiresOfficer = dist == "WHISPER" and (kind == "PING" or kind == "PONG"
                 or kind == "LINK" and fields[2] ~= "error" and fields[2] ~= "wait"),
             requiresLinkPermission = dist == "WHISPER" and kind == "LINK" and fields[2] ~= "error" and fields[2] ~= "wait" }
@@ -141,7 +146,7 @@ function U.Pump()
     if now < retryAt or now - lastSend < 0.13 or U.ChatLocked() then return end
     local q, job
     while true do
-        q = #queues[1] > 0 and queues[1] or queues[2]
+        q = #queues[1] > 0 and queues[1] or #queues[2] > 0 and queues[2] or queues[3]
         job = q[1]
         if not job then return end
         if (job.expiresAt and now > job.expiresAt) or (job.dist == "GUILD" and not U.guild) or (job.requiresGateway and not U.IsGateway())
