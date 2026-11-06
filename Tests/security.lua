@@ -7,10 +7,74 @@ local boundary = assert(source:find("\nlocal a = NewClient", 1, true), "simulati
 local factory = assert(loadstring(source:sub(1, boundary - 1) .. "\n" .. [[
 return { NewClient = NewClient, Step = Step, SetRosters = SetRosters, Count = Count,
     Reset = function() clients, wire, deliveryFilter = {}, {}, nil; time = time + 100 end,
-    SetFilter = function(filter) deliveryFilter = filter end }
+    SetFilter = function(filter) deliveryFilter = filter end,
+    Now = function() return time end }
 ]]))
 local H = factory()
 local failures, sequence = 0, 100000
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local officer = H.NewClient("Офицер Четвёртого", 1, 4); officer.officer = true
+    local ordinary = H.NewClient("Первый Участник", 1, 1); ordinary.officer = false; ordinary.invitePermission = true
+    H.SetRosters(0)
+    assert(gm.U.CanRelay(officer.name) and officer.U.CanRelay(), "native officer flag at rank four is not eligible")
+    assert(not gm.U.CanRelay(ordinary.name) and not ordinary.U.CanRelay(), "rank one or invitation permission was mistaken for officer status")
+    ordinary.E.C_GuildInfo.IsGuildOfficer = function() return true end
+    assert(not ordinary.U.CanRelay(), "self officer claim overrode the server rank permissions")
+    gm.U.db.approvedRelays = { [ordinary.name] = 1 }
+    assert(not gm.U.CanRelay(ordinary.name), "legacy manual grant admitted an ordinary relay")
+    ordinary.U.Command("relay on " .. ordinary.name)
+    assert(not ordinary.U.CanRelay(), "obsolete relay command elevated an ordinary member")
+    officer.E.C_GuildInfo.GuildControlGetRankFlags = function() error("unavailable") end
+    officer.E.C_GuildInfo.IsGuildOfficer = function() return false end
+    assert(not officer.U.CanRelay(), "failed permission lookup fell back to rank or cached officer state")
+    officer.E.C_GuildInfo.GuildControlGetRankFlags = nil
+    officer.E.C_GuildInfo.IsGuildOfficer = function() return true end
+    assert(not officer.U.CanRelay(), "missing rank permission API trusted only a self declaration")
+    print("PASS native officer permissions, custom ranks, invitation-only members and fail-closed lookup")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local backup = H.NewClient("Запасной Чиллзон", 1, 4); backup.officer = true
+    local otherGM = H.NewClient("Глава Навсегда", 2, 0)
+    local otherBackup = H.NewClient("Запасной Навсегда", 2, 5); otherBackup.officer = true
+    local member = H.NewClient("Обычный Участник", 1, 2)
+    H.SetRosters(0)
+    for _, c in ipairs({ gm, backup, otherGM, otherBackup, member }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3)
+    assert(not backup.U.GatewayName() and not otherBackup.U.GatewayName(), "officers invented trust before initial guild pairing")
+    assert(gm.U.Link(otherGM.name), "initial guild setup rejected")
+    H.Step(70)
+    assert(member.U.Connected(), "ordinary reader did not learn the initial connection")
+    assert(backup.U.TrustedPeer(otherBackup.name) == 2 and otherBackup.U.TrustedPeer(backup.name) == 1,
+        "verified rosters did not automatically discover other-guild officers")
+    assert(not otherGM.U.TrustedPeer(member.name), "ordinary roster member became a foreign relay")
+    otherBackup.officer = false; H.SetRosters(0); H.Step(30)
+    assert(not backup.U.TrustedPeer(otherBackup.name), "foreign officer permission revoke was not applied through roster deltas")
+    otherBackup.officer = true; H.SetRosters(0); H.Step(30)
+    assert(backup.U.TrustedPeer(otherBackup.name) == 2, "foreign officer permission restore did not refresh candidates")
+    gm.live, otherGM.live = false, false; H.SetRosters(0); H.Step(140)
+    assert(backup.U.IsGateway() and otherBackup.U.IsGateway() and member.U.Connected(),
+        "officers did not pair and replace both original gateways automatically")
+    assert(not next(backup.requestedLinks) and not next(otherBackup.requestedLinks), "automatic failover depended on fixture approval")
+    local count = #otherBackup.U.history
+    member.U.SendChat("Automatic officer failover"); H.Step(15)
+    assert(#otherBackup.U.history == count + 1, "chat did not resume through automatically paired officers")
+    local fresh = H.NewClient("Новый Офицер", 1, 6); fresh.officer = true
+    H.SetRosters(0); fresh.U.frame.scripts.OnEvent(fresh.U.frame, "PLAYER_LOGIN"); H.Step(60)
+    assert(fresh.U.Connected() and backup.U.GatewayName() == backup.name, "late officer needed manual trust sync or preempted the active bridge")
+    backup.officer = false; H.SetRosters(0); H.Step(140)
+    assert(not backup.U.CanRelay() and fresh.U.IsGateway() and otherBackup.U.Connected(), "officer demotion did not revoke and replace a gateway")
+    fresh.officer = false; H.SetRosters(0); H.Step(100)
+    assert(not member.U.GatewayName() and not member.U.Connected() and not member.U.CanRelay(), "no-officer outage elected an ordinary member")
+    fresh.officer = true; H.SetRosters(0); H.Step(140)
+    assert(fresh.U.Connected() and member.U.Connected(), "officer return did not restore the approved guild link")
+    print("PASS automatic officer discovery, both-side failover, late installation, demotion, outage and recovery")
+end
 local function Check(label, vulnerable, detail)
     print((vulnerable and "VULNERABLE " or "PASS ") .. label .. " | " .. detail)
     if vulnerable then failures = failures + 1 end
@@ -73,12 +137,12 @@ do
     local nonce = "999.1"
     local received = Listen(outsider, function(kind, fields, sender)
         if kind == "LINK" and fields[2] == "challenge" then
-            Send(outsider, sender, "LINK", { "2", "prove", 1, nonce, fields[5] })
+            Send(outsider, sender, "LINK", { "3", "prove", 1, nonce, fields[5] })
         elseif kind == "PING" then
             Send(outsider, sender, "PONG", { 1, outsider.name, outsider.U.Pack({ outsider.name }) })
         end
     end)
-    Send(outsider, officer.name, "LINK", { "2", "hello", 1, nonce, "" })
+    Send(outsider, officer.name, "LINK", { "3", "hello", 1, nonce, "" })
     H.Step(35)
     local trusted = officer.U.TrustedPeer(outsider.name) ~= nil
     officer.U.frame.scripts.OnEvent(officer.U.frame, "CHAT_MSG_GUILD", "PRIVATE guild-only test message", officer.name .. "-ForeverRealm")
@@ -201,6 +265,7 @@ end
 do
     H.Reset()
     local old = {
+        trustSchema = 2,
         contacts = { ["Посторонний Игрок"] = { guild = 2, addon = true, approved = true, at = 1800000000 } },
         rosters = { [2] = { at = 1800000000, rows = { ["Посторонний Игрок"] = { name = "Посторонний Игрок", rank = 0, guild = 2, online = true } } } },
         approvedRelays = { ["Участник Чиллзон"] = true },
@@ -211,7 +276,7 @@ do
         minimapAngle = 42, chatFrameName = "Гильдия",
     }
     local c = H.NewClient("Участник Чиллзон", 1, 2, { realms = { ["ForeverRealm:Alliance"] = old } })
-    assert(c.U.PREFIX == "CZUnion2" and c.U.db.trustSchema == 2, "defensive protocol/schema migration missing")
+    assert(c.U.PREFIX == "CZUnion3" and c.U.db.trustSchema == 3, "defensive protocol/schema migration missing")
     assert(not c.U.TrustedPeer("Посторонний Игрок") and H.Count(c.U.db.contacts) == 0 and H.Count(c.U.db.rosters) == 0, "old unverified contacts or foreign roster survived migration")
     assert(H.Count(c.U.Tickets()) == 0 and c.U.db.announcement == nil and H.Count(c.U.db.addonPresence) == 0, "old foreign action/presence state survived migration")
     assert(H.Count(c.U.db.approvedRelays) == 0, "old cached ordinary relay permissions survived migration")
@@ -245,31 +310,25 @@ end
 do
     H.Reset()
     local gm = H.NewClient("Глава Чиллзон", 1, 0)
-    local backup = H.NewClient("Связной Чиллзон", 1, 2)
+    local backup = H.NewClient("Связной Чиллзон", 1, 4); backup.officer = true
     local otherGM = H.NewClient("Глава Навсегда", 2, 0)
-    local otherBackup = H.NewClient("Связной Навсегда", 2, 2)
+    local otherBackup = H.NewClient("Связной Навсегда", 2, 5); otherBackup.officer = true
     H.SetRosters(0)
     for _, c in ipairs({ gm, backup, otherGM, otherBackup }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
     H.Step(3)
-    assert(gm.U.AuthorizeRelay(backup.name, true) and otherGM.U.AuthorizeRelay(otherBackup.name, true), "native officers could not authorize local backups")
     assert(gm.U.Link(otherGM.name), "native officers could not approve initial bridge")
     H.Step(55)
-    -- These are deliberate native-officer endorsements, not injected DB state.
-    assert(gm.U.ApproveContact(otherBackup.name, 2, true) and otherGM.U.ApproveContact(backup.name, 1, true), "native officers could not endorse counterpart backup identities")
-    H.Step(5)
-    assert(backup.U.CanRelay() and otherBackup.U.CanRelay(), "explicit local backup approval did not reach ordinary members")
-    assert(backup.U.Link(otherBackup.name), "explicitly endorsed backups could not perform their direct pairing")
-    H.Step(35)
+    assert(backup.U.CanRelay() and otherBackup.U.CanRelay(), "native officers did not become automatic backup candidates")
     gm.live, otherGM.live = false, false; H.SetRosters(0); H.Step(150)
     assert(backup.U.GatewayName() == backup.name and otherBackup.U.GatewayName() == otherBackup.name
-        and backup.U.Connected() and otherBackup.U.Connected(), "explicitly approved backups could not maintain union after native officers logged out")
+        and backup.U.Connected() and otherBackup.U.Connected(), "officer backups could not maintain union after original leaders logged out")
     assert(not backup.U.IsMaster() and not backup.U.CanInvite() and not otherBackup.U.IsMaster(), "relay approval granted unrelated native guild powers")
-    local unused = H.NewClient("Аарон Новый", 1, 1)
+    local unused = H.NewClient("Аарон Новый", 1, 2)
     H.SetRosters(0); unused.U.frame.scripts.OnEvent(unused.U.frame, "PLAYER_LOGIN"); H.Step(35)
-    assert(backup.U.GatewayName() == backup.name and backup.U.Connected(), "new alphabetically earlier unpaired native officer displaced working approved ordinary relay")
+    assert(backup.U.GatewayName() == backup.name and backup.U.Connected(), "new alphabetically earlier member displaced working officer relay")
     local fresh = H.NewClient("Новый Участник", 1, 2)
     H.SetRosters(0); fresh.U.frame.scripts.OnEvent(fresh.U.frame, "PLAYER_LOGIN"); H.Step(25)
-    assert(H.Count(fresh.U.db.contacts) == 0 and not fresh.U.CanRelay(backup.name) and not fresh.U.Connected(), "ordinary relay HELLO bootstrapped unsigned trust into fresh installation")
+    assert(fresh.U.CanRelay(backup.name) and fresh.U.Connected(), "native officer heartbeat did not automatically connect a fresh reader")
     gm.live = true; H.SetRosters(0)
     assert(gm.U.ShareTrust() and not fresh.U.ShareTrust(), "trust sharing is not restricted to native guild officers")
     H.Step(5); backup.U.SayHello(); H.Step(50)
@@ -281,25 +340,18 @@ do
     Send(fresh, nil, "RELAYSET", { 1, fresh.U.Pack({ fresh.name }) }, "GUILD"); H.Step(2)
     assert(not gm.U.CanRelay(fresh.name), "ordinary member replaced authoritative relay grant set")
     for _, fields in ipairs({
-        { 1, gm.U.Pack({ backup.name, "Нет В Гильдии" }) },
-        { 2, gm.U.Pack({ backup.name }) },
-        { 1, gm.U.Pack({ backup.name, backup.name }) },
+        { 1, gm.U.Pack({ fresh.name }) },
+        { 2, gm.U.Pack({ fresh.name }) },
+        { 1, gm.U.Pack({ fresh.name, fresh.name }) },
     }) do
         Send(gm, nil, "RELAYSET", fields, "GUILD"); H.Step(2)
-        assert(fresh.U.CanRelay(backup.name), "malformed officer relay set partially changed previously valid permissions")
+        assert(not fresh.U.CanRelay() and fresh.U.CanRelay(backup.name), "legacy officer relay set overrode native permissions")
     end
-    H.SetFilter(function(packet, recipient)
-        return not (packet.from == gm and recipient == fresh and packet.text:find("~RRELAY~", 1, true))
-    end)
-    assert(gm.U.AuthorizeRelay(backup.name, false), "native officer could not revoke local backup")
-    H.Step(3)
-    assert(fresh.U.CanRelay(backup.name), "empty relay-set test did not simulate a lost incremental revoke")
-    H.SetFilter(nil)
-    assert(gm.U.ShareTrust(), "native officer could not share authoritative empty relay set")
-    H.Step(5)
-    assert(not fresh.U.CanRelay(backup.name), "authoritative empty relay set did not clear stale own-guild backup approval")
-    print("PASS explicitly officer-approved ordinary backups reconnect after both officers leave without native privilege escalation")
-    print("PASS fresh-client native officer trust sync, shared chat, atomic relay-set validation and authoritative empty revocation")
+    Send(gm, nil, "RELAY", { fresh.name, "1" }, "GUILD"); H.Step(3)
+    assert(not fresh.U.CanRelay(), "legacy native-officer relay grant enabled an ordinary member")
+    backup.officer = false; H.SetRosters(0); H.Step(5)
+    assert(not fresh.U.CanRelay(backup.name), "native permission revocation retained an officer backup")
+    print("PASS automatic officer backups, fresh readers, shared chat and rejection of all legacy relay grants")
 end
 
 do
@@ -307,7 +359,7 @@ do
     local officer = H.NewClient("Офицер Навсегда", 2, 1)
     local outsider = H.NewClient("Посторонний Игрок", nil, 2)
     H.SetRosters(0); officer.U.frame.scripts.OnEvent(officer.U.frame, "PLAYER_LOGIN")
-    Send(outsider, officer.name, "LINK", { "2", "hello", 1, "888.1", "" }); H.Step(2)
+    Send(outsider, officer.name, "LINK", { "3", "hello", 1, "888.1", "" }); H.Step(2)
     local request = officer.U.PendingLink()
     assert(request and request.name == outsider.name and not officer.U.TrustedPeer(outsider.name), "unverified inbound request was not held pending explicit officer action")
     officer.U.OpenSettings()
@@ -322,7 +374,7 @@ do
     assert(recorded == outsider.name, "approval button used editable connection input instead of captured requester")
     local staleCallback = controls.accept.scripts.OnClick
     officer.U.DeclineLink(outsider.name); H.Step(1)
-    Send(outsider, officer.name, "LINK", { "2", "hello", 1, "888.2", "" }); H.Step(2)
+    Send(outsider, officer.name, "LINK", { "3", "hello", 1, "888.2", "" }); H.Step(2)
     recorded = nil; staleCallback()
     assert(recorded == nil, "stale approval button authorized a replacement inbound request")
     officer.U.Refresh()
@@ -341,29 +393,32 @@ do
     H.SetRosters(0)
     for i = 1, 33 do gm.rows[#gm.rows + 1] = { name = "Резерв" .. i .. " Участник", rank = 2, online = false, level = 20 } end
     gm.U.ReadRoster()
-    for i = 1, 32 do assert(gm.U.AuthorizeRelay("Резерв" .. i .. " Участник", true), "officer could not authorize an allowed backup within cap") end
-    assert(not gm.U.AuthorizeRelay("Резерв33 Участник", true) and H.Count(gm.U.db.approvedRelays) == 32, "officer backup authorization cap exceeded 32")
-    print("PASS native officer relay approvals remain bounded to 32 own-guild members")
+    gm.U.db.approvedRelays = {}
+    for i = 1, 33 do
+        local name = "Резерв" .. i .. " Участник"
+        gm.U.db.approvedRelays[name] = 1
+        assert(not gm.U.CanRelay(name), "legacy cached ordinary grant became an automatic officer")
+    end
+    assert(gm.U.AuthorizeRelay == nil, "manual relay authorization is still exposed")
+    print("PASS legacy manual grants cannot enable ordinary members")
 end
 
 do
     H.Reset()
     local gm = H.NewClient("Глава Чиллзон", 1, 0)
-    local relay = H.NewClient("Персонаж Связной", 1, 2)
+    local relay = H.NewClient("Персонаж Связной", 1, 4); relay.officer = true
     local otherGM = H.NewClient("Глава Навсегда", 2, 0)
     H.SetRosters(0)
     for _, c in ipairs({ gm, relay, otherGM }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
     H.Step(3)
-    assert(gm.U.AuthorizeRelay(relay.name, true), "source guild could not approve its native member")
-    H.Step(3)
-    assert(relay.U.CanRelay() and relay.U.db.approvedRelays[relay.name] == 1, "source relay approval has no issuing-guild scope")
+    assert(relay.U.CanRelay(), "native officer not eligible in source guild")
+    relay.officer = false
     relay.guild = 2; relay.U.frame.scripts.OnEvent(relay.U.frame, "PLAYER_GUILD_UPDATE", "player")
     H.SetRosters(0); H.Step(3)
     assert(relay.U.guild == 2 and not relay.U.CanRelay(), "character inherited old guild's relay grant after moving to other guild")
-    assert(otherGM.U.AuthorizeRelay(relay.name, true), "destination native officer could not issue a fresh relay grant")
-    H.Step(3)
-    assert(relay.U.CanRelay() and relay.U.db.approvedRelays[relay.name] == 2, "destination grant did not replace old guild scope")
-    print("PASS relay authorization is scoped to issuing guild and cannot follow a character into the other guild")
+    relay.officer = true; H.SetRosters(0)
+    assert(relay.U.CanRelay(), "destination native officer rights did not enable the new guild's officer")
+    print("PASS relay eligibility follows current guild permissions rather than old guild grants")
 end
 
 do
@@ -374,17 +429,296 @@ do
     for _, c in ipairs({ gm, otherGM }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
     H.Step(3); assert(gm.U.Link(otherGM.name), "officer-alt fixture could not establish original pair"); H.Step(55)
     local alt = H.NewClient("Другой Офицер", 1, 1, gm.E.ChillZoneUnionDB)
-    H.SetRosters(0); alt.U.frame.scripts.OnEvent(alt.U.frame, "PLAYER_LOGIN"); H.Step(5)
+    H.SetRosters(0); alt.U.frame.scripts.OnEvent(alt.U.frame, "PLAYER_LOGIN"); H.Step(30)
+    assert(otherGM.U.TrustedPeer(alt.name) == 1, "new officer was not discovered through the established link")
     local contact = alt.U.db.contacts[otherGM.name]
     assert(alt.U.db == gm.U.db and contact.pairedBy[gm.name] == true and not contact.pairedBy[alt.name], "per-character pairing fixture does not share cache without sharing proof")
-    assert(alt.U.CanRelay() and alt.U.GatewayName() ~= alt.name, "second native-officer alt inherited another character's pairing readiness")
+    assert(alt.U.CanRelay() and alt.U.GatewayName() ~= alt.name, "new officer preempted the active original gateway")
     gm.live = false; H.SetRosters(0); H.Step(100)
-    assert(alt.U.GatewayName() == nil and not alt.U.Connected(), "unpaired officer alt silently became a gateway after original character logged out")
-    assert(alt.U.Link(otherGM.name), "officer alt could not request its own explicit pairing")
-    H.Step(55)
-    assert(alt.U.Connected() and alt.U.db.contacts[otherGM.name].pairedBy[alt.name] == true,
-        "officer alt's own pairing did not establish readiness")
-    print("PASS shared account cache does not transfer pairing proof to another native-officer character")
+    assert(alt.U.IsGateway() and alt.U.Connected(), "native officer alt needed separate manual pairing")
+    assert(not next(alt.requestedLinks), "officer alt required manual fixture approval")
+    print("PASS verified officer alt reuses approved guild contacts automatically")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local otherGM = H.NewClient("Глава Навсегда", 2, 0)
+    local backup = H.NewClient("Яков Связной", 1, 4); backup.officer = true
+    local otherBackup = H.NewClient("Яков Навсегда", 2, 5); otherBackup.officer = true
+    H.SetRosters(0)
+    for _, c in ipairs({ gm, otherGM, backup, otherBackup }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(gm.U.Link(otherGM.name)); H.Step(70)
+    assert(gm.U.RosterFresh(2) and gm.U.db.rosters[2].verified, "candidate cache fixture lacks an authenticated roster")
+    gm.U.db.contacts[otherBackup.name] = nil
+    assert(gm.U.TrustedPeer(otherBackup.name) == 2, "bounded contact cache hid a roster-verified officer")
+    assert(not gm.U.RowUnpack(gm.U.Pack({ "Игрок Тест", 4, "Офицер", 20, "PRIEST", "", "1", "true" }), 2), "malformed officer permission flag was accepted")
+    local saved, otherSaved = backup.E.ChillZoneUnionDB, otherBackup.E.ChillZoneUnionDB
+    H.Reset()
+    local restored = H.NewClient(backup.name, 1, 4, saved); restored.officer = true
+    local otherRestored = H.NewClient(otherBackup.name, 2, 5, otherSaved); otherRestored.officer = true
+    H.SetRosters(0)
+    for _, c in ipairs({ restored, otherRestored }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(150)
+    assert(restored.U.Connected() and otherRestored.U.Connected(), "saved approved guild link did not recover after both officer clients reloaded")
+    assert(not next(restored.requestedLinks) and not next(otherRestored.requestedLinks), "cold recovery required a manual request")
+    print("PASS roster-verified officers outside the probe cache, strict role schema and both-side cold recovery")
+end
+
+do
+    H.Reset()
+    local officer = H.NewClient("Офицер С Очередью", 1, 4); officer.officer = true
+    local otherGM = H.NewClient("Глава Навсегда", 2, 0)
+    H.SetRosters(0)
+    assert(officer.U.Link(otherGM.name), "officer could not queue setup before demotion")
+    officer.officer = false; H.SetRosters(0)
+    local sentHandshake = false
+    H.SetFilter(function(packet)
+        if packet.from == officer and packet.dist == "WHISPER" and packet.text:find("~RLINK~", 1, true) then sentHandshake = true end
+        return true
+    end)
+    H.Step(8)
+    assert(not sentHandshake and not otherGM.U.PendingLink(), "queued officer handshake survived native permission revocation")
+    print("PASS queued setup is discarded after native officer demotion")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local veteran = H.NewClient("Настоящий Ветеран", 1, 4); veteran.officer = false; veteran.rankName = "Ветеран"; veteran.invitePermission = false
+    local ordinary = H.NewClient("Обычный Участник", 1, 2); ordinary.officer = false
+    local honorary = H.NewClient("Почётный Участник", 1, 5); honorary.officer = false; honorary.rankName = "Почётный ветеран"
+    H.SetRosters(0)
+    assert(veteran.U.CanRelay() and gm.U.CanRelay(veteran.name) and not veteran.U.IsOfficer() and not veteran.U.CanInvite(), "real nonofficer veteran did not become relay independently of invitation rights")
+    assert(not ordinary.U.CanRelay() and not honorary.U.CanRelay(), "ordinary or similarly named rank became a veteran relay")
+    assert(gm.U.IsVeteranRankName("  ВЕТЕРАН  ") and not gm.U.IsVeteranRankName("Ветераны") and not gm.U.IsVeteranRankName("Почётный ветеран"), "veteran recognition does not use exact trimmed case-insensitive rank name")
+    assert(not veteran.U.IsTrustOfficer() and not veteran.U.CanStartLink("Неизвестный Связной") and not veteran.U.Link("Неизвестный Связной") and not veteran.U.ShareTrust(), "veteran acquired first-link or trust administration rights")
+    veteran.U.OpenSettings()
+    assert(not veteran.U.linkApprovalControls.accept:IsShown() and veteran.U.linkApprovalControls.share.enabled == false, "veteran can operate native-officer approval controls")
+    print("PASS exact native veteran rank eligibility without officer, invitation or bootstrap administration rights")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local veteran = H.NewClient("Ветеран Чиллзон", 1, 4); veteran.officer = false; veteran.rankName = "Ветеран"
+    local otherGM = H.NewClient("Глава Навсегда", 2, 0)
+    local otherVeteran = H.NewClient("Ветеран Навсегда", 2, 5); otherVeteran.officer = false; otherVeteran.rankName = "Ветеран"
+    local reader = H.NewClient("Участник Чиллзон", 1, 2)
+    H.SetRosters(0)
+    for _, c in ipairs({ gm, veteran, otherGM, otherVeteran, reader }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(gm.U.Link(otherGM.name)); H.Step(70)
+    assert(veteran.U.TrustedPeer(otherVeteran.name) == 2 and otherVeteran.U.TrustedPeer(veteran.name) == 1, "verified union rosters did not discover nonofficer veteran counterparts")
+    gm.live, otherGM.live = false, false; H.SetRosters(0); H.Step(140)
+    assert(veteran.U.IsGateway() and otherVeteran.U.IsGateway() and reader.U.Connected(), "veterans did not replace both officer gateways automatically")
+    assert(not next(veteran.requestedLinks) and not next(otherVeteran.requestedLinks), "veteran failover depended on fixture Link approval")
+    reader.U.SendChat("Shared chat through real veterans"); H.Step(12)
+    assert(HasHistory(otherVeteran, "Shared chat through real veterans"), "shared chat did not resume through nonofficer veteran gateways")
+    local fresh = H.NewClient("Новый Читатель", 1, 2)
+    H.SetRosters(0); fresh.U.frame.scripts.OnEvent(fresh.U.frame, "PLAYER_LOGIN"); H.Step(30)
+    assert(not fresh.U.Connected() and not fresh.U.TrustedPeer(otherVeteran.name), "veteran-only heartbeats created first trust for a fresh client without native-officer anchor")
+    gm.live = true; H.SetRosters(0); assert(gm.U.ShareTrust()); H.Step(5)
+    veteran.U.SayHello(); H.Step(45)
+    assert(fresh.U.Connected() and fresh.U.TrustedPeer(otherVeteran.name) == 2, "native-officer anchor did not bootstrap fresh reader to already running veteran relays")
+    gm.live = false; H.SetRosters(0); H.Step(80)
+    otherVeteran.U.SendChat("Fresh reader after native anchor leaves"); H.Step(12)
+    assert(HasHistory(fresh, "Fresh reader after native anchor leaves"), "fresh anchored client lost shared chat when only veterans remained online")
+    veteran.rankName = "Участник"; H.SetRosters(0); H.Step(100)
+    assert(not veteran.U.CanRelay() and not veteran.U.IsGateway() and not reader.U.Connected(), "demoted nonofficer veteran kept operating as gateway")
+    veteran.rankName = "Ветеран"; H.SetRosters(0); H.Step(140)
+    assert(veteran.U.Connected() and reader.U.Connected(), "restored veteran rank did not resume approved union connection")
+    print("PASS both-side veteran failover, veteran-only reader anchoring, demotion and automatic return")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local staleOfficer = H.NewClient("Офицер Со Старым Кэшем", 1, 1)
+    local otherGM = H.NewClient("Глава Навсегда", 2, 0)
+    local veteran = H.NewClient("Ветеран Навсегда", 2, 4); veteran.officer = false; veteran.rankName = "Ветеран"
+    H.SetRosters(0)
+    for _, c in ipairs({ gm, staleOfficer, otherGM, veteran }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(gm.U.Link(otherGM.name)); H.Step(70)
+    assert(gm.U.TrustedPeer(veteran.name) == 2 and staleOfficer.U.db.contacts[veteran.name], "stale-endorsement fixture never discovered veteran")
+    staleOfficer.live = false
+    veteran.rankName = "Участник"; H.SetRosters(0); H.Step(30)
+    assert(gm.U.RosterFresh(2) and not gm.U.TrustedPeer(veteran.name), "verified remote veteran revocation did not remove trust")
+    assert(staleOfficer.U.db.contacts[veteran.name], "offline native officer did not retain deliberately stale cache")
+    local sentStale = false
+    H.SetFilter(function(packet)
+        if packet.from == staleOfficer and packet.dist == "GUILD" and packet.text:find(veteran.name, 1, true) then sentStale = true end
+        return true
+    end)
+    staleOfficer.live = true; H.SetRosters(0)
+    assert(staleOfficer.U.ShareTrust()); staleOfficer.U.SayHello(); H.Step(4)
+    assert(sentStale, "stale native-officer endorsement was not delivered over the wire")
+    assert(not gm.U.TrustedPeer(veteran.name) and not gm.U.db.contacts[veteran.name], "stale native-officer HELLO/CONTACT overrode fresh verified veteran revocation")
+    H.SetFilter(nil)
+    print("PASS fresh verified veteran revocation defeats stale native-officer contact gossip")
+end
+
+do
+    H.Reset()
+    local actor = H.NewClient("Офицер С Очередью", 1, 4); actor.officer = true
+    local target = H.NewClient("Глава Навсегда", 2, 0)
+    H.SetRosters(0)
+    assert(actor.U.Link(target.name), "native officer could not queue first setup before veteran demotion")
+    actor.officer = false; actor.rankName = "Ветеран"; H.SetRosters(0)
+    assert(actor.U.CanRelay() and not actor.U.CanStartLink(target.name), "queued-link fixture did not retain veteran relay but lose bootstrap authority")
+    local sent = false
+    H.SetFilter(function(packet) if packet.from == actor and packet.text:find("~RLINK~", 1, true) then sent = true end; return true end)
+    H.Step(8)
+    assert(not sent and not target.U.PendingLink(), "queued first LINK escaped after native officer became a nonadmin veteran")
+    H.SetFilter(nil)
+    H.Reset()
+    actor = H.NewClient("Офицер Затем Ветеран", 1, 4); actor.officer = true
+    target = H.NewClient("Глава Навсегда", 2, 0)
+    H.SetRosters(0)
+    for _, c in ipairs({ actor, target }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(actor.U.Link(target.name)); H.Step(60)
+    actor.officer = false; actor.rankName = "Ветеран"; H.SetRosters(0); H.Step(20)
+    assert(actor.U.CanRelay() and actor.U.CanStartLink(target.name), "known approved counterpart became unavailable to a legitimate veteran")
+    assert(actor.U.Link(target.name)); actor.requestedLinks = {}; H.Step(35)
+    assert(actor.U.Connected(), "veteran could not reconnect a known approved counterpart without new administrative approval")
+    print("PASS late queued bootstrap permission guard preserves eligible veteran reconnection")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Первая", 1, 0)
+    local otherGM = H.NewClient("Глава Вторая", 2, 0)
+    H.SetRosters(0)
+    for _, c in ipairs({ gm, otherGM }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(gm.U.Link(otherGM.name)); H.Step(55)
+    local switched, setRemote = false, otherGM.U.SetRemote
+    otherGM.U.SetRemote = function(name, paired)
+        local accepted = setRemote(name, paired)
+        if otherGM.U.remote and otherGM.U.remote.name ~= gm.name then switched = true end
+        return accepted
+    end
+    local alt = H.NewClient("Аарон Новый", 1, 4, gm.E.ChillZoneUnionDB); alt.officer = true
+    H.SetRosters(0); alt.U.frame.scripts.OnEvent(alt.U.frame, "PLAYER_LOGIN")
+    alt.locked = true; H.Step(8); alt.locked = false; H.Step(30)
+    assert(not switched and otherGM.U.remote.name == gm.name and gm.U.GatewayName() == gm.name, "queued stale PING transiently stole an established remote even though final election recovered")
+    print("PASS delayed candidate PING never transiently preempts an established gateway")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Глава Чиллзон", 1, 0)
+    local remote = H.NewClient("Яков Глава Навсегда", 2, 0)
+    local function AddRemoteVeterans()
+        for i = 1, 32 do remote.rows[#remote.rows + 1] = { name = string.format("AAA%02d Ветеран", i), rank = 4, rankName = "Ветеран", online = true, level = 20 } end
+        assert(remote.U.ReadRoster())
+    end
+    H.SetRosters(0); AddRemoteVeterans()
+    for _, c in ipairs({ gm, remote }) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(gm.U.Link(remote.name)); H.Step(70)
+    assert(remote.U.PublishRoster(gm.name))
+    for _ = 1, 25 do H.Step(0.2); if not gm.U.db.contacts[remote.name] then break end end
+    assert(not gm.U.db.contacts[remote.name] and H.Count(gm.U.db.contacts) == 30 and gm.U.TrustedPeer(remote.name) == 2,
+        "large-candidate fixture did not evict active foreign endpoint while retaining verified-roster trust")
+    local fresh = H.NewClient("Новый Читатель Большой Гильдии", 1, 2)
+    H.SetRosters(0); AddRemoteVeterans(); fresh.U.frame.scripts.OnEvent(fresh.U.frame, "PLAYER_LOGIN")
+    local advertised, queue = nil, gm.U.Queue
+    gm.U.Queue = function(kind, fields, ...)
+        if kind == "HELLO" and not advertised then advertised = gm.U.Unpack(fields[3]) end
+        return queue(kind, fields, ...)
+    end
+    assert(gm.U.SayHello())
+    assert(advertised and advertised[1] == remote.name and #advertised <= 3, "native officer HELLO omitted its active verified endpoint outside the 30-contact cache")
+    local seen = {}; for _, name in ipairs(advertised) do assert(not seen[name], "active endpoint appeared twice in bounded HELLO contacts"); seen[name] = true end
+    H.Step(8)
+    assert(fresh.U.TrustedPeer(remote.name) == 2 and fresh.U.Connected(), "fresh reader did not connect using first native-officer active-endpoint advertisement")
+    gm.rank, gm.officer, gm.rankName = 4, false, "Ветеран"
+    local unanchored = H.NewClient("Ещё Новый Читатель", 1, 2)
+    H.SetRosters(0); AddRemoteVeterans(); unanchored.U.frame.scripts.OnEvent(unanchored.U.frame, "PLAYER_LOGIN")
+    assert(gm.U.CanRelay() and not gm.U.IsTrustOfficer()); gm.U.SayHello(); H.Step(8)
+    assert(not unanchored.U.TrustedPeer(remote.name) and not unanchored.U.Connected(), "active-endpoint advertisement from veteran created an unauthorized first trust anchor")
+    print("PASS active verified endpoint survives bounded HELLO advertisement without granting veteran bootstrap authority")
+end
+
+do
+    H.Reset()
+    local gm = H.NewClient("Яков Чиллзон", 1, 0)
+    local otherGM = H.NewClient("Яков Навсегда", 2, 0)
+    local veteran = H.NewClient("Ярослав Чиллзон", 1, 4); veteran.officer = false; veteran.rankName = "Ветеран"
+    local otherVeteran = H.NewClient("Ярослав Навсегда", 2, 5); otherVeteran.officer = false; otherVeteran.rankName = "Ветеран"
+    local players = { gm, otherGM, veteran, otherVeteran }
+    local leaders = { [1] = gm.name, [2] = otherGM.name }
+    local function DummyName(i, guild) return string.format("AAA%02d Ветеран%d", i, guild) end
+    local function NativeRoster(cold)
+        H.SetRosters(0)
+        for _, c in ipairs(players) do
+            for i = 1, 32 do c.rows[#c.rows + 1] = { name = DummyName(i, c.guild), rank = c.guild == 1 and 4 or 5, rankName = "Ветеран", online = true, level = 35 } end
+            if cold then c.rows[#c.rows + 1] = { name = leaders[c.guild], rank = 0, rankName = "Глава", online = false, level = 60 } end
+            assert(c.U.ReadRoster())
+        end
+    end
+    local function Copy(value)
+        if type(value) ~= "table" then return value end
+        local result = {}; for key, item in pairs(value) do result[key] = Copy(item) end; return result
+    end
+    NativeRoster(false)
+    for _, c in ipairs(players) do c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN") end
+    H.Step(3); assert(gm.U.Link(otherGM.name)); H.Step(70)
+    for change = 1, 34 do
+        for _, c in ipairs(players) do
+            for _, row in ipairs(c.rows) do if row.name == DummyName(1, c.guild) then row.level = 35 + change % 10 end end
+            c.U.frame.scripts.OnEvent(c.U.frame, "GUILD_ROSTER_UPDATE")
+        end
+        H.Step(6)
+    end
+    assert(H.Count(veteran.U.db.contacts) == 30 and H.Count(otherVeteran.U.db.contacts) == 30
+        and not veteran.U.db.contacts[otherVeteran.name] and not otherVeteran.U.db.contacts[veteran.name], "large-guild failover fixture did not evict both real backup addresses")
+    assert(veteran.U.TrustedPeer(otherVeteran.name) == 2 and otherVeteran.U.TrustedPeer(veteran.name) == 1, "verified role roster no longer authorizes real backups outside contact cache")
+    local saved, otherSaved = Copy(veteran.E.ChillZoneUnionDB), Copy(otherVeteran.E.ChillZoneUnionDB)
+    gm.live, otherGM.live = false, false; NativeRoster(false); H.Step(180)
+    assert(veteran.U.Connected() and otherVeteran.U.Connected(), "both real veteran backups failed to reconnect behind thirty online non-addon candidates")
+
+    -- A separate cold start retains authenticated trust but has no optional
+    -- version-display history, so fairness cannot depend on known-addon priority.
+    saved.realms["ForeverRealm:Alliance"].addonPresence = {}
+    otherSaved.realms["ForeverRealm:Alliance"].addonPresence = {}
+    H.Reset()
+    veteran = H.NewClient("Ярослав Чиллзон", 1, 4, saved); veteran.officer = false; veteran.rankName = "Ветеран"
+    otherVeteran = H.NewClient("Ярослав Навсегда", 2, 5, otherSaved); otherVeteran.officer = false; otherVeteran.rankName = "Ветеран"
+    players = { veteran, otherVeteran }; NativeRoster(true)
+    local began, firstReal, queues = H.Now(), {}, {}
+    for _, c in ipairs(players) do
+        local sender, queue = c.E.C_ChatInfo.SendAddonMessage, c.U.Queue
+        queues[c.name] = {}
+        c.E.C_ChatInfo.SendAddonMessage = function(prefix, message, distribution, target)
+            if distribution == "WHISPER" and message:find("~RPING~", 1, true) and (target == veteran.name or target == otherVeteran.name) then
+                firstReal[c.name] = firstReal[c.name] or H.Now() - began
+            end
+            return sender(prefix, message, distribution, target)
+        end
+        c.U.Queue = function(kind, fields, distribution, target, ...)
+            local result = queue(kind, fields, distribution, target, ...)
+            if result and kind == "PING" then queues[c.name][#queues[c.name] + 1] = H.Now() end
+            return result
+        end
+        c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN")
+    end
+    H.Step(180)
+    assert(veteran.U.Connected() and otherVeteran.U.Connected(), "unknown-version cold backup pool starved real eligible endpoints")
+    local delayed = false
+    for _, c in ipairs(players) do
+        if firstReal[c.name] then
+            assert(firstReal[c.name] < 180, "real cold backup was not probed within the recovery budget")
+            if firstReal[c.name] >= 60 then delayed = true end
+        end
+        local attempts = queues[c.name]
+        for i = 1, #attempts do
+            local count = 0
+            for j = i, #attempts do if attempts[j] - attempts[i] < 14.999 then count = count + 1 end end
+            assert(count <= 3, "large candidate recovery exceeded three queued probes per fifteen seconds")
+        end
+    end
+    assert(delayed, "unknown-version fairness fixture did not exercise candidates beyond the first minute of probes")
+    print("PASS both-side veteran recovery outside contact cap, fair unknown-candidate rotation and unchanged probe budget; firstReal="
+        .. tostring(firstReal[veteran.name]) .. "/" .. tostring(firstReal[otherVeteran.name]))
 end
 
 assert(failures == 0, "security regressions observed: " .. failures)

@@ -17,18 +17,31 @@ local function IsTextKind(kind)
 end
 function U.OtherGuild() return U.guild == 1 and 2 or 1 end
 function U.IsTrustOfficer(name)
-    local row = U.guild and U.own and U.own[name or U.me]
-    return row ~= nil and (row.rank == 0 or row.rank == 1)
+    name = name or U.me
+    local row = U.guild and U.own and U.own[name]
+    if not row or not U.RosterFresh(U.guild) then return false end
+    return name == U.me and U.IsOfficer() or name ~= U.me and U.RankIsOfficer(row.rank)
 end
 function U.CanRelay(name)
     name = name or U.me
-    if not U.guild or not U.own or not U.own[name] then return false end
-    return U.IsTrustOfficer(name) or U.db and U.db.approvedRelays and U.db.approvedRelays[name] == U.guild or false
+    local row = U.guild and U.own and U.own[name]
+    return row ~= nil and U.RosterFresh(U.guild) and (U.IsTrustOfficer(name) or U.IsVeteranRankName(row.rankName)) or false
+end
+local function FreshForeignRejection(name, guild)
+    local cache = U.db and U.db.rosters and U.db.rosters[guild]
+    if guild ~= U.OtherGuild() or not cache or not cache.verified or not U.RosterFresh(guild) then return false end
+    return not cache.rows[name] or not U.RowCanRelay(cache.rows[name])
 end
 function U.TrustedPeer(name)
     if not U.db or not U.guild or not name or U.own[name] then return nil end
+    if FreshForeignRejection(name, U.OtherGuild()) then return nil end
     local c = U.db.contacts[name]
     if c and c.approved == true and c.guild == U.OtherGuild() then return c.guild end
+    -- The bounded probe/contact cache need not contain every officer. A roster
+    -- authenticated through the approved link also authorizes its officers.
+    local cache = U.db.rosters[U.OtherGuild()]
+    local row = cache and cache.verified and cache.rows[name]
+    if row and U.RowCanRelay(row) then return U.OtherGuild() end
 end
 function U.TrustedTransferPeer(name)
     return U.TransferPeer and U.TransferPeer(name) or nil
@@ -43,8 +56,9 @@ end
 local function Contact(name, guild, share, approve)
     name, guild = U.Name(name), tonumber(guild)
     if not name or name == U.me or U.own[name] or not U.GUILDS[guild] or guild == U.guild then return false end
+    if FreshForeignRejection(name, guild) then return false end
     local old = U.db.contacts[name]
-    if not approve and (not old or old.approved ~= true or old.guild ~= guild) then return false end
+    if not approve and U.TrustedPeer(name) ~= guild then return false end
     local fresh = not old or old.addon ~= true or old.guild ~= guild
     U.db.contacts[name] = { guild = guild, at = U.stamp(), addon = true, approved = true,
         pairedBy = old and old.guild == guild and old.approved == true and old.pairedBy or nil }
@@ -66,45 +80,41 @@ local function PairReady(name)
     if not U.CanRelay(name) then return false end
     if name ~= U.me then return U.peers[name] and U.peers[name].pairReady == true or false end
     for _, contact in pairs(U.db.contacts) do
-        if contact.approved == true and type(contact.pairedBy) == "table" and contact.pairedBy[U.me] == true
-            and contact.guild == U.OtherGuild() then return true end
+        if contact.approved == true and contact.guild == U.OtherGuild() then return true end
     end
     return false
 end
-function U.AuthorizeRelay(name, allowed)
-    name = U.Name(name)
-    if not U.IsTrustOfficer() or not name or not U.own[name] or U.IsTrustOfficer(name) or type(allowed) ~= "boolean" then return false end
-    if allowed and not (U.db.approvedRelays and U.db.approvedRelays[name] == U.guild) then
-        local count = 0
-        for member, guild in pairs(U.db.approvedRelays or {}) do if guild == U.guild and U.own[member] then count = count + 1 end end
-        if count >= 32 then U.Print("Можно назначить не более 32 резервных связных одной гильдии.") return false end
-    end
-    if not U.Queue("RELAY", { name, allowed and "1" or "0" }, "GUILD", nil, true) then return false end
-    U.db.approvedRelays = U.db.approvedRelays or {}
-    U.db.approvedRelays[name] = allowed and U.guild or nil
-    if U.Refresh then U.Refresh() end
-    return true
-end
 function U.ShareTrust()
     if not U.IsTrustOfficer() then return false end
-    local jobs, relays = {}, {}
+    local jobs = {}
     for name, contact in pairs(U.db.contacts) do
         if contact.approved == true and contact.guild == U.OtherGuild() then
             jobs[#jobs + 1] = { kind = "CONTACT", fields = { name, contact.guild }, dist = "GUILD", priority = true }
         end
     end
-    for name, guild in pairs(U.db.approvedRelays or {}) do
-        if guild == U.guild and U.own[name] and not U.IsTrustOfficer(name) then relays[#relays + 1] = name end
-    end
-    table.sort(relays)
-    if #relays > 32 then return false end
-    jobs[#jobs + 1] = { kind = "RELAYSET", fields = { U.guild, U.Pack(relays) }, dist = "GUILD", priority = true }
     if not U.QueueBatch(jobs) then return false end
-    U.Print("Подтверждённые контакты и разрешения отправлены участникам своей гильдии, которые сейчас в игре с аддоном.")
+    U.Print("Подтверждённые контакты отправлены участникам своей гильдии, которые сейчас в игре с аддоном. Связные выбираются автоматически.")
     return true
 end
--- Membership alone does not prove that a player runs this addon.
-function U.LearnRosterContacts() end
+-- Only complete rosters/deltas from an already authenticated union connection
+-- can introduce new foreign officers. HELLO/candidate claims cannot do so.
+function U.LearnRosterContacts(guild, rows)
+    if guild ~= U.OtherGuild() then return end
+    for name, c in pairs(U.db.contacts) do
+        if c.guild == guild and (not rows[name] or not U.RowCanRelay(rows[name])) then
+            U.db.contacts[name], U.links[name], U.inboundLinks[name], U.probes[name] = nil, nil, nil, nil
+            if U.remote and U.remote.name == name then U.remote, U.gatewaySince = nil, nil end
+            if U.linkState and U.linkState.name == name then U.linkState = nil end
+        end
+    end
+    local names = {}
+    for name, row in pairs(rows) do if U.RowCanRelay(row) then names[#names + 1] = name end end
+    table.sort(names, function(a, b)
+        if rows[a].online ~= rows[b].online then return rows[a].online end
+        return a < b
+    end)
+    for i = 1, math.min(30, #names) do U.ApproveContact(names[i], guild) end
+end
 local function Alive(name)
     if not name or not U.guild then return false end
     local row = U.own[name]
@@ -178,8 +188,17 @@ function U.SayHello()
     for n, c in pairs(U.db.contacts) do
         if c.approved == true and c.guild ~= U.guild and c.addon == true then list[#list + 1] = { name = n, at = c.at or 0 } end
     end
-    table.sort(list, function(a, b) if a.at == b.at then return a.name < b.name end return a.at > b.at end)
-    for i = 1, math.min(3, #list) do contacts[#contacts + 1] = list[i].name end
+    local active = U.remote and U.remote.name or U.linkState and U.linkState.name
+    if active and U.TrustedPeer(active) == U.OtherGuild() then contacts[1] = active end
+    table.sort(list, function(a, b)
+        if (a.name == active) ~= (b.name == active) then return a.name == active end
+        if a.at == b.at then return a.name < b.name end
+        return a.at > b.at
+    end)
+    for _, entry in ipairs(list) do
+        if #contacts >= 3 then break end
+        if entry.name ~= active then contacts[#contacts + 1] = entry.name end
+    end
     local gateway = U.GatewayName()
     local remote = gateway == U.me and U.remote and U.clock() - U.remote.at < PEER_FOR and U.remote.name or ""
     local queued = U.Queue("HELLO", { U.guild, U.VERSION, U.Pack(contacts), remote, gateway or "", remote ~= "" and (U.gatewaySince or 0) or 0, PairReady() and "1" or "0" }, "GUILD", nil, true)
@@ -193,7 +212,7 @@ function U.OnRosterReady()
 end
 local function SendPing(name, introduction)
     if not U.guild or not U.CanRelay() or not Alive(U.me) or not U.TrustedPeer(name) or (not introduction and not U.IsGateway()) then return false end
-    if U.Queue("PING", { U.guild, U.CandidateNames(), U.GatewayName() or "" }, "WHISPER", name, true) then
+    if U.Queue("PING", { U.guild, U.CandidateNames(), U.GatewayName() or "" }, "WHISPER", name, true, false, nil, not introduction) then
         U.probes[name] = { at = U.clock(), untilAt = U.clock() + 30 }
         U.pings[name] = U.clock()
         return true
@@ -203,8 +222,10 @@ end
 function U.SetRemote(name, paired)
     if paired and U.CanRelay() and U.TrustedPeer(name) then
         local contact = U.db.contacts[name]
-        if type(contact.pairedBy) ~= "table" then contact.pairedBy = {} end
-        contact.pairedBy[U.me] = true
+        if contact then
+            if type(contact.pairedBy) ~= "table" then contact.pairedBy = {} end
+            contact.pairedBy[U.me] = true
+        end
     end
     if not U.IsGateway() or not U.TrustedPeer(name) then return false end
     local changed = not U.remote or U.remote.name ~= name
@@ -223,7 +244,7 @@ function U.SetRemote(name, paired)
 end
 local function ValidNonce(n) return U.Text(n, 40) and n ~= "" and n:match("^[%d%.]+$") ~= nil end
 local function LinkSend(name, mode, nonce, challenge)
-    return U.Queue("LINK", { "2", mode, U.guild, nonce, challenge or "" }, "WHISPER", name, true)
+    return U.Queue("LINK", { "3", mode, U.guild, nonce, challenge or "" }, "WHISPER", name, true)
 end
 local function ReplyLink(name, mode, nonce, challenge)
     local now = U.clock()
@@ -246,7 +267,7 @@ function U.Link(name)
         U.Print(U.setup.message); return false
     end
     if not U.CanStartLink(name) then
-        Setup("error", name, "Новое соединение настраивает глава или офицер с игровым рангом 0–1. Одобренный ретранслятор может подключаться только к ранее одобренным контактам.")
+        Setup("error", name, "Первое соединение настраивает глава или персонаж с игровыми офицерскими правами. Обычные участники не становятся связными.")
         U.Print(U.setup.message); return false
     end
     name = U.Name(name)
@@ -271,7 +292,7 @@ function U.Link(name)
     U.links[name] = { outbound = true, nonce = nonce, guild = U.OtherGuild(), phase = "hello", at = U.clock(), untilAt = U.clock() + HANDSHAKE_TIMEOUT, nextAt = U.clock() + LINK_RETRY }
     U.db.setupContact = name
     Setup("connecting", name, "Ожидаем подтверждения соединения от " .. U.SafeDisplay(name) .. "…")
-    U.Print("Соединяем гильдии через " .. U.SafeDisplay(name) .. ". Новый контакт должен один раз подтвердить запрос на второй стороне после проверки полного имени.")
+    U.Print("Соединяем гильдии через " .. U.SafeDisplay(name) .. ". Первое соединение гильдий нужно подтвердить на второй стороне после проверки полного имени.")
     return true
 end
 local function InboundLink(name)
@@ -295,7 +316,7 @@ end
 function U.AcceptLink(name)
     local canonical, request = InboundLink(name)
     if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt or U.ChatLocked() then return false end
-    request.approved, request.challenge = true, U.NewID()
+    request.approved, request.challenge, request.manual = true, U.NewID(), true
     request.untilAt = U.clock() + HANDSHAKE_TIMEOUT
     ReplyLink(canonical, "challenge", request.nonce, request.challenge)
     if U.Refresh then U.Refresh() end
@@ -324,7 +345,7 @@ local function OutgoingLink(sender, nonce, guild)
     end
 end
 local function TakeLink(f, sender)
-    if #f ~= 5 or f[1] ~= "2" or not U.guild or U.own[sender] or not ValidNonce(f[4]) then return end
+    if #f ~= 5 or f[1] ~= "3" or not U.guild or U.own[sender] or not ValidNonce(f[4]) then return end
     local mode, guild, nonce, challenge = f[2], tonumber(f[3]), f[4], f[5]
     if guild ~= U.OtherGuild() then return end
     if mode == "hello" then
@@ -355,8 +376,12 @@ local function TakeLink(f, sender)
         -- A challenge proves only liveness. A local native officer must first approve
         -- the exact external endpoint; authorized relay operators remain trusted.
         if not p.completed then
+            if p.manual and not U.IsTrustOfficer() then return end
+            if not U.ApproveContact(sender, guild, true) then
+                ReplyLink(sender, "wait", nonce, "roster")
+                return
+            end
             p.completed = true
-            U.ApproveContact(sender, guild, true)
             U.SetRemote(sender, true)
             U.SayHello()
             lastPing = -100
@@ -376,7 +401,11 @@ local function TakeLink(f, sender)
             Setup("connecting", sender, "Офицер ответил. Проверяем соединение…")
         elseif mode == "ready" then
             if p.phase ~= "prove" or not p.challenge or p.challenge ~= challenge then return end
-            U.ApproveContact(sender, guild, true); U.links[sender] = nil
+            if not U.ApproveContact(sender, guild, true) then
+                Setup("connecting", sender, "Свежий состав ещё не подтверждает права выбранного связного. Ожидаем обновления состава и повторяем соединение.")
+                return
+            end
+            U.links[sender] = nil
             U.SetRemote(sender, true)
             U.SayHello(); lastPing = -100
             Setup("connecting", sender, "Ответ проверен. Соединяем общий чат гильдий…")
@@ -728,26 +757,6 @@ function U.Handle(kind, f, dist, sender, id)
             end
         elseif kind == "CONTACT" then
             if #f == 2 and tonumber(f[2]) == U.OtherGuild() and U.IsTrustOfficer(sender) then U.ApproveContact(f[1], f[2]); lastPing = -100 end
-        elseif kind == "RELAY" then
-            local name = #f == 2 and U.Name(f[1])
-            if not name or not U.IsTrustOfficer(sender) or not U.own[name] or U.IsTrustOfficer(name) or (f[2] ~= "0" and f[2] ~= "1") then return end
-            U.db.approvedRelays = U.db.approvedRelays or {}
-            U.db.approvedRelays[name] = f[2] == "1" and U.guild or nil
-            if U.Refresh then U.Refresh() end
-        elseif kind == "RELAYSET" then
-            if #f ~= 2 or tonumber(f[1]) ~= U.guild or not U.IsTrustOfficer(sender) then return end
-            local names = U.Unpack(f[2], 32)
-            if not names then return end
-            local approved = {}
-            for _, name in ipairs(names) do
-                if U.Name(name) ~= name or not U.own[name] or U.IsTrustOfficer(name) or approved[name] then return end
-                approved[name] = U.guild
-            end
-            for name, guild in pairs(U.db.approvedRelays or {}) do
-                if (guild == 1 or guild == 2) and guild ~= U.guild and not approved[name] then approved[name] = guild end
-            end
-            U.db.approvedRelays = approved
-            if U.Refresh then U.Refresh() end
         elseif kind == "REMOTE" then
             if #f ~= 3 or sender ~= U.GatewayName() then return end
             local fields = U.Unpack(f[2])
@@ -766,6 +775,7 @@ function U.Handle(kind, f, dist, sender, id)
     local guild = U.TrustedPeer(sender)
     if not guild then return end
     if kind == "PING" then
+        if not U.CanRelay() then return end
         if (#f ~= 2 and #f ~= 3) or tonumber(f[1]) ~= guild then return end
         U.AddContact(sender, guild)
         U.LearnCandidates(f[2], guild)
@@ -773,6 +783,7 @@ function U.Handle(kind, f, dist, sender, id)
         local senderGateway = #f == 3 and U.Name(f[3]) or sender
         if senderGateway == sender and U.IsGateway() then U.SetRemote(sender) end
     elseif kind == "PONG" then
+        if not U.CanRelay() then return end
         if #f ~= 3 or tonumber(f[1]) ~= guild or not U.Name(f[2]) then return end
         local probe = U.probes[sender]
         if not probe or U.clock() > probe.untilAt then return end
@@ -827,6 +838,9 @@ function U.NetworkTick()
     if gateway ~= lastGateway then
         lastGateway = gateway
         if gateway == U.me then
+            -- A new gateway starts a fair round; known-addon candidates
+            -- win the initial unprobed tie instead of inheriting old probes.
+            U.pings = {}
             for _, entry in ipairs(Recent()) do
                 if entry.guild == U.guild and entry.id and entry.status == "pending" and U.stamp() - (entry.time or 0) < OUTBOX_FOR then QueueCross(RecordFields(entry)) end
             end
@@ -850,21 +864,39 @@ function U.NetworkTick()
     if now - lastPing < 15 then return end
     lastPing = now
     if U.remote then SendPing(U.remote.name); return end
-    local list = {}
+    local list, candidates = {}, {}
     for name, c in pairs(U.db.contacts) do
         -- Old caches get one migration probe per login; new candidates are confirmed addon users.
         local eligible = c.approved == true and (c.addon == true or (c.addon == nil and not legacyTried[name]))
-        if c.guild ~= U.guild and not U.own[name] and eligible and now - (U.pings[name] or -100) > 90 then list[#list + 1] = name end
+        if c.guild == U.OtherGuild() and not U.own[name] and eligible then candidates[name] = true end
+    end
+    local roster = U.db.rosters[U.OtherGuild()]
+    if roster and roster.verified then
+        for name, row in pairs(roster.rows) do if U.RowCanRelay(row) and not U.own[name] then candidates[name] = true end end
+    end
+    for name in pairs(candidates) do
+        if now - (U.pings[name] or -math.huge) > 90 then list[#list + 1] = name end
+    end
+    local presence = U.db.addonPresence and U.db.addonPresence[U.OtherGuild()] or {}
+    local function KnownAddon(name)
+        local info = presence[name]
+        local version = type(info) == "table" and info.version
+        return U.Text(version, 40) and version ~= "" and version:match("^[A-Za-z0-9%.%-]+$") ~= nil or false
     end
     table.sort(list, function(a, b)
-        local ca, cb = U.db.contacts[a], U.db.contacts[b]
-        if (ca.addon == true) ~= (cb.addon == true) then return ca.addon == true end
+        local pa, pb = U.pings[a] or -math.huge, U.pings[b] or -math.huge
+        if pa ~= pb then return pa < pb end
+        local ka, kb = KnownAddon(a), KnownAddon(b)
+        if ka ~= kb then return ka end
+        local ca, cb = U.db.contacts[a] or {}, U.db.contacts[b] or {}
         if (ca.at or 0) ~= (cb.at or 0) then return (ca.at or 0) > (cb.at or 0) end
         return a < b
     end)
+    while #list > 1500 do table.remove(list) end
     for i = 1, math.min(3, #list) do
         local name = list[i]
-        if SendPing(name) and U.db.contacts[name].addon == nil then legacyTried[name] = true end
+        local contact = U.db.contacts[name]
+        if SendPing(name) and contact and contact.addon == nil then legacyTried[name] = true end
     end
 end
 U.On("CHAT_MSG_GUILD", function(text, sender)
