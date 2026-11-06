@@ -4,6 +4,7 @@ local lastRequest, lastRead, lastAttempt, changedAt, dirtySince = -100, -100, -1
 local dirty, pending, deltaPending = true, {}, {}
 local acceptedAt, needsFull = {}, {}
 local published, wasGateway
+local authorityRevision, authorityRows = 0, {}
 local READ_RETRY, READ_GAP, MAX_DEBOUNCE, DELTA_EVERY, FRESH_FOR = 3, 5, 8, 5, 25
 local function MarkDirty()
     local now = U.clock()
@@ -98,25 +99,54 @@ end
 local function SafeNumber(v, fallback)
     return U.Public(v) and type(v) == "number" and v or fallback
 end
+local function ReadRow(index)
+    local name, rankName, rank, level, _, zone, _, _, online, _, class = GetGuildRosterInfo(index)
+    name = U.Name(name)
+    if not name or not U.Public(rank) or not U.Public(online) or not U.Public(level) then return nil end
+    return { name = name, rankName = U.Text(rankName, 120) and rankName or "",
+        rank = SafeNumber(rank, 99), level = SafeNumber(level, 0),
+        zone = U.Text(zone, 180) and zone or "", online = online and true or false,
+        class = U.Text(class, 30) and class or "", guild = U.guild, officer = U.RankIsOfficer(rank),
+        rosterIndex = index, authorityRevision = authorityRevision }
+end
+-- Native roster/rank events invalidate authority immediately. Query only rows
+-- actually used for authorization while the full roster remains debounced.
+-- A reordered index cannot authorize a different character.
+function U.AuthorityRow(name)
+    local row = U.guild and U.own[name]
+    if not row or not U.own[U.me] or U.clock() - lastRead > 60 then return nil end
+    if row.authorityRevision == authorityRevision then return row end
+    if authorityRows[name] ~= nil then return authorityRows[name] or nil end
+    local ok, current = false, nil
+    if row.rosterIndex then ok, current = pcall(ReadRow, row.rosterIndex) end
+    if not ok or not current or current.name ~= name then current = nil end
+    authorityRows[name] = current or false
+    return current
+end
+local function AuthorityChanged()
+    authorityRevision, authorityRows = authorityRevision + 1, {}
+    U.InvalidateRankPermissions()
+    MarkDirty()
+end
 function U.ReadRoster()
     lastAttempt = U.clock()
     if not U.guild or U.ChatLocked() then return Incomplete() end
     local count = GetNumGuildMembers()
     if not U.Public(count) or type(count) ~= "number" or count < 1 or count > 1500 then return Incomplete() end
+    U.InvalidateRankPermissions()
     local rows = {}
     for i = 1, count do
-        local name, rankName, rank, level, _, zone, _, _, online, _, class = GetGuildRosterInfo(i)
-        name = U.Name(name)
-        if not name or not U.Public(rank) or not U.Public(online) or not U.Public(level) then return Incomplete() end
-        rows[name] = { name = name, rankName = U.Text(rankName, 120) and rankName or "",
-            rank = SafeNumber(rank, 99), level = SafeNumber(level, 0),
-            zone = U.Text(zone, 180) and zone or "", online = online and true or false,
-            class = U.Text(class, 30) and class or "", guild = U.guild, officer = U.RankIsOfficer(rank) }
+        local row = ReadRow(i)
+        if not row then return Incomplete() end
+        rows[row.name] = row
     end
     if not rows[U.me] then return Incomplete() end
     local before = U.own
     local firstReady = not before[U.me] or before[U.me].guild ~= U.guild
     U.own, lastRead, dirty = rows, U.clock(), false
+    authorityRows, U.ownRosterFreshUntil = {}, lastRead + 60
+    U.rosterRevision = (U.rosterRevision or 0) + 1
+    if U.ElectionChanged then U.ElectionChanged() end
     dirtySince = nil
     U.db.rosters[U.guild] = { rows = rows, at = U.stamp(), fullAt = U.stamp(), source = U.me }
     Announce(U.guild, before, rows, firstReady)
@@ -334,8 +364,8 @@ function U.RosterTick()
         U.PublishRosterDelta(U.remote.name)
     end
 end
-U.On("GUILD_ROSTER_UPDATE", MarkDirty)
-U.On("GUILD_RANKS_UPDATE", MarkDirty)
-U.On("GUILD_RANKS_UPDATE_ACTIVE_PLAYER", MarkDirty)
-U.On("PLAYER_GUILD_UPDATE", MarkDirty)
+U.On("GUILD_ROSTER_UPDATE", AuthorityChanged)
+U.On("GUILD_RANKS_UPDATE", AuthorityChanged)
+U.On("GUILD_RANKS_UPDATE_ACTIVE_PLAYER", AuthorityChanged)
+U.On("PLAYER_GUILD_UPDATE", AuthorityChanged)
 U.On("PLAYER_REGEN_ENABLED", MarkDirty)

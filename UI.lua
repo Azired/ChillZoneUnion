@@ -469,11 +469,11 @@ RenderRoster = function()
     if hovered then ShowRosterTooltip(hovered) end
     Native.RefreshLocationFilter()
 end
-local states = { proposed = "Ожидает согласия", accepted = "Согласен; ждёт выхода", ready = "Можно пригласить", declined = "Отказ", done = "Завершён" }
+local states = { proposed = "Ожидает согласия", pending = "Ждём подтверждения второй гильдии", accept_error = "Согласие не подтверждено; повторите", replaced = "Заменена новой заявкой", accepted = "Согласие подтверждено; ждёт выхода", ready = "Можно пригласить", declined = "Отказ", done = "Завершён" }
 local function TicketPriority(t)
-    if t.member == U.me and (t.state == "proposed" or t.state == "accepted") then return 1 end
+    if t.member == U.me and (t.state == "proposed" or t.state == "pending" or t.state == "accept_error" or t.state == "accepted") then return 1 end
     if t.dest == U.guild and t.state == "ready" and U.CanInvite() then return 2 end
-    if t.state ~= "done" and t.state ~= "declined" then return 3 end
+    if t.state ~= "done" and t.state ~= "declined" and t.state ~= "replaced" then return 3 end
     return 4
 end
 RenderTickets = function()
@@ -499,9 +499,10 @@ RenderTickets = function()
     if t and U.stamp() - t.created >= 1800 then t = nil end
     ticketInfo:SetText(t and (U.SafeDisplay(t.member) .. "\n" .. U.GUILDS[t.source] .. " " .. ArrowText("right", 10) .. " " .. U.GUILDS[t.dest] .. "\nГлава: " .. U.SafeDisplay(t.master) .. "\n" .. (states[t.state] or t.state)) or "Выберите переход в списке.\n\nВаши заявки и переходы, где нужно действие, показаны первыми.\n\nПредложение создаётся главой из вкладки «Состав». Участник принимает его и выходит штатной командой. Офицер второй гильдии отправляет приглашение.\n\nЗаявки действуют 30 минут.")
     local mine = t and t.member == U.me and t.source == U.guild
-    Enable(acceptButton, mine and t.state == "proposed")
-    Enable(declineButton, mine and t.state == "proposed")
-    Enable(leaveButton, mine and t.state == "accepted")
+    Enable(acceptButton, mine and (t.state == "proposed" or t.state == "accept_error"))
+    acceptButton:SetText(t and t.state == "accept_error" and "Повторить согласие" or "Согласиться")
+    Enable(declineButton, mine and (t.state == "proposed" or t.state == "pending" or t.state == "accept_error"))
+    Enable(leaveButton, mine and U.TransferConfirmed and U.TransferConfirmed(t))
     Enable(inviteButton, t and t.dest == U.guild and t.state == "ready" and U.CanInvite())
 end
 local function ClassCount(value, known)
@@ -953,13 +954,12 @@ end
 
 function U.RefreshChat()
     local reading = ReadingChat()
-    local nextSeen, lines, keys, added = {}, {}, {}, 0
+    local nextSeen, lines, keys = {}, {}, {}
     for i, h in ipairs(U.history) do
         -- A native observation keeps its identity when the gateway supplies its ID.
         local key = h
         nextSeen[key], keys[i] = true, key
         if not seenHistory[key] then
-            added = added + 1
             if not reading and h.name ~= U.me and not h.replayed then unread = unread + 1 end
         end
         if chatLog then lines[i] = U.ChatLine and U.ChatLine(h, true) or (U.SafeDisplay(h.name) .. ": " .. U.ChatText(h.text)) end
@@ -967,6 +967,8 @@ function U.RefreshChat()
     seenHistory = nextSeen
     if chatLog then
         local oldOffset, bottom, prefix = ChatOffset(), AtBottom(), #lines >= #renderedLines
+        local anchorIndex = math.max(1, #renderedKeys - math.floor(oldOffset))
+        local anchor = renderedKeys[anchorIndex]
         for i, line in ipairs(renderedLines) do if keys[i] ~= renderedKeys[i] or lines[i] ~= line then prefix = false; break end end
         if prefix then
             for i = #renderedLines + 1, #lines do chatLog:AddMessage(lines[i], 0.25, 1, 0.25) end
@@ -975,7 +977,21 @@ function U.RefreshChat()
             for _, line in ipairs(lines) do chatLog:AddMessage(line, 0.25, 1, 0.25) end
         end
         if bottom then chatLog:ScrollToBottom()
-        elseif oldOffset > 0 then chatLog:SetScrollOffset(oldOffset + added) end
+        elseif oldOffset > 0 then
+            local positions = {}
+            for index, key in ipairs(keys) do positions[key] = index end
+            local position = anchor and positions[anchor]
+            -- The bounded history may have evicted the anchor. Keep the nearest
+            -- retained neighbour, preferring the next newer message.
+            if not position then
+                for distance = 1, #renderedKeys do
+                    local newer, older = renderedKeys[anchorIndex + distance], renderedKeys[anchorIndex - distance]
+                    position = newer and positions[newer] or older and positions[older]
+                    if position then break end
+                end
+            end
+            chatLog:SetScrollOffset(position and math.max(0, #keys - position) or math.min(oldOffset, math.max(0, #keys - 1)))
+        end
         renderedLines, renderedKeys = lines, keys
         RenderAnnouncement()
     end

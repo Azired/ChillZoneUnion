@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends lua5.1
-      - name: Run the simulation and access-control regressions
+      - name: Run the simulation, access-control and audit regressions
         shell: bash
         run: |
           set -euo pipefail

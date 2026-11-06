@@ -30,10 +30,41 @@ end
 local queues = { {}, {} }
 local buffers, seen, lastSend = {}, {}, -100
 local perSender, retryAt = {}, 0
+local bufferSenders, bufferCount, bufferBytes = {}, 0, 0
+local MAX_BUFFERS, MAX_MESSAGE_BYTES, BUFFER_FOR = 80, 10000, 90
+local MAX_BUFFER_BYTES = MAX_BUFFERS * MAX_MESSAGE_BYTES
+local function DropBuffer(key)
+    local b = buffers[key]
+    if not b then return end
+    buffers[key] = nil
+    bufferCount, bufferBytes = bufferCount - 1, bufferBytes - b.bytes
+    local n = bufferSenders[b.sender] - 1
+    bufferSenders[b.sender] = n > 0 and n or nil
+end
+local function ExpireBuffers(now)
+    for key, b in pairs(buffers) do
+        -- Retries cannot extend a sender's reservation indefinitely.
+        if now - b.at > BUFFER_FOR then DropBuffer(key) end
+    end
+end
+local function BufferRoom(privileged)
+    if bufferCount < MAX_BUFFERS then return true end
+    if not privileged then return false end
+    -- Authenticated gateways may borrow an ordinary member's oldest slot.
+    -- Ordinary newcomers never displace another sender's active assembly.
+    local oldest, oldestAt
+    for key, b in pairs(buffers) do
+        if not b.privileged and (not oldestAt or b.at < oldestAt) then oldest, oldestAt = key, b.at end
+    end
+    if not oldest then return false end
+    DropBuffer(oldest)
+    return true
+end
 U.queueStats = { sent = 0, failed = 0, received = 0, dropped = 0 }
 function U.QueueSize() return #queues[1] + #queues[2] end
 function U.ClearQueue()
     queues = { {}, {} }; buffers = {}; seen = {}; perSender = {}
+    bufferSenders, bufferCount, bufferBytes = {}, 0, 0
 end
 local function Plan(kind, fields, dist, target, priority, logged, fixedID, requiresGateway, expiresAt, cancelKey)
     if not U.guild and kind ~= "READY" then return nil end
@@ -156,27 +187,46 @@ function U.Receive(prefix, message, distribution, sender)
     local transferReady = distribution == "WHISPER" and U.TrustedTransferPeer
         and U.TrustedTransferPeer(sender) and total == 1 and data:sub(1, 7) == "RREADY~"
     if not trusted and not transferReady and (total ~= 1 or data:sub(1, 6) ~= "RLINK~") then return end
+    local now = U.clock()
     local rate = perSender[sender]
-    if not rate or U.clock() - rate.at > 10 then rate = { at = U.clock(), n = 0 }; perSender[sender] = rate end
+    if not rate or now - rate.at > 10 then rate = { at = now, n = 0 }; perSender[sender] = rate end
     rate.n = rate.n + 1
     if rate.n > 220 then return end
     local key = sender .. ":" .. distribution .. ":" .. id
     if seen[key] then return end
-    local b = buffers[key]
-    if not b then
-        local n = 0; for _ in pairs(buffers) do n = n + 1 end
-        if n >= 80 then return end
-        b = { at = U.clock(), total = total, n = 0, bytes = 0, parts = {} }; buffers[key] = b
-    end
-    if b.total ~= total then buffers[key] = nil return end
-    if not b.parts[part] then
-        if b.bytes + #data > 10000 then buffers[key] = nil; return end
+    local encoded
+    if total == 1 then
+        -- Completed packets need no multipart reservation, even when every
+        -- shared slot is occupied. Authentication and rate limits still apply.
+        if buffers[key] then DropBuffer(key); return end
+        encoded = data
+    else
+        ExpireBuffers(now)
+        local b = buffers[key]
+        if b and b.total ~= total then DropBuffer(key); return end
+        if not b then
+            local privileged = trusted and (distribution == "WHISPER" or U.GatewayName and U.GatewayName() == sender)
+            -- A sender's guild and whisper fragments share the same quota.
+            -- Larger gateway batches still use the unchanged 54-part limit.
+            if (bufferSenders[sender] or 0) >= (privileged and 16 or 4) then return end
+            if not BufferRoom(privileged) or bufferBytes + #data > MAX_BUFFER_BYTES then return end
+            b = { sender = sender, privileged = privileged, at = now, total = total, n = 0, bytes = 0, parts = {} }
+            buffers[key] = b
+            bufferSenders[sender], bufferCount = (bufferSenders[sender] or 0) + 1, bufferCount + 1
+        end
+        if b.parts[part] then
+            if b.parts[part] ~= data then DropBuffer(key) end
+            return
+        end
+        if b.bytes + #data > MAX_MESSAGE_BYTES or bufferBytes + #data > MAX_BUFFER_BYTES then DropBuffer(key); return end
         b.parts[part] = data; b.n = b.n + 1; b.bytes = b.bytes + #data
+        bufferBytes = bufferBytes + #data
+        if b.n ~= total then return end
+        encoded = table.concat(b.parts)
+        DropBuffer(key)
     end
-    if b.n ~= total then return end
-    buffers[key] = nil; seen[key] = U.clock()
-    local encoded = table.concat(b.parts)
-    if #encoded > 10000 then return end
+    seen[key] = now
+    if #encoded > MAX_MESSAGE_BYTES then return end
     local raw
     if encoded:sub(1, 1) == "R" then raw = encoded:sub(2)
     elseif trusted and D and type(D.DecompressDeflateLimited) == "function" and encoded:sub(1, 1) == "Z" then
@@ -192,7 +242,7 @@ function U.Receive(prefix, message, distribution, sender)
 end
 function U.ProtocolClean()
     local now = U.clock()
-    for k, b in pairs(buffers) do if now - b.at > 90 then buffers[k] = nil end end
+    ExpireBuffers(now)
     for k, t in pairs(seen) do if now - t > 180 then seen[k] = nil end end
     for k, r in pairs(perSender) do if now - r.at > 60 then perSender[k] = nil end end
 end

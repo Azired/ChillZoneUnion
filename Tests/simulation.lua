@@ -1001,6 +1001,12 @@ do
     local pane
     for _, frame in ipairs(gm.allFrames) do if frame.frameType == "ScrollingMessageFrame" then pane = frame end end
     expect(pane, "shared history pane not created")
+    -- A real scrolled pane has retained rows to anchor. The native widget
+    -- cannot have a ten-line scroll offset when its history is empty.
+    for i = 1, 20 do
+        gm.U.Chat(1, gm.name, "scroll anchor fixture " .. i, true,
+            { id = "1:scroll:fixture:" .. i, at = gm.U.stamp() - 20 + i, status = "delivered", replayed = true })
+    end
     pane:SetScrollOffset(10)
     gm.U.Chat(1, "Друг Игрок", "Не прыгать вниз", false, { id = "1:scroll:test", at = gm.U.stamp(), status = "pending" })
     eq(pane:GetScrollOffset(), 11, "new message changed the reader's place")
@@ -2841,9 +2847,9 @@ do
     local transfer = MenuEntry(context, "Предложить переход")
     expect(transfer and transfer.enabled, "configured union leader lacks remote context transfer action")
     local before = Count(owner.U.Tickets())
-    owner.rank = 2; owner.U.own[owner.name].rank = 2; transfer.callback()
+    owner.rank = 2; SetRosters(0); transfer.callback()
     eq(Count(owner.U.Tickets()), before, "context transfer responder trusted stale union leader permissions")
-    owner.rank = 0; owner.U.own[owner.name].rank = 0; owner.U.CloseRosterContextMenu()
+    owner.rank = 0; SetRosters(0); owner.U.CloseRosterContextMenu()
     context = OpenRosterMenu(owner, member.name, 2); ActivateMenu(context, "Предложить переход"); Step(12)
     local reverse
     for _, ticket in pairs(member.U.Tickets()) do if ticket.member == member.name and ticket.master == owner.name and ticket.source == 2 and ticket.dest == 1 then reverse = ticket end end

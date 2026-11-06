@@ -1,6 +1,6 @@
 local _, U = ...
 ChillZoneUnion = U
-U.VERSION, U.PREFIX = "0.9.0-beta", "CZUnion3"
+U.VERSION, U.PREFIX = "0.9.1-beta", "CZUnion3"
 U.GUILDS = { "Чиллзон", "Чиллзон Навсегда" }
 U.GUILD_LEADERS = { [1] = "Вован Дубан" }
 U.UNION_LEADER = "Вован Дубан"
@@ -165,17 +165,37 @@ function U.CanInvite()
     local ok, allowed = pcall(fn)
     return ok and U.Public(allowed) and allowed == true
 end
+local rankPermissions, rankPermissionAPI, rankPermissionUntil = {}, nil, -1
+function U.InvalidateRankPermissions()
+    rankPermissions, rankPermissionUntil = {}, -1
+    U.rankPermissionRevision = (U.rankPermissionRevision or 0) + 1
+    if U.ElectionChanged then U.ElectionChanged() end
+end
+function U.RankPermissionsCurrent()
+    local fn = C_GuildInfo and C_GuildInfo.GuildControlGetRankFlags
+    local now = U.clock()
+    if fn ~= rankPermissionAPI or now >= rankPermissionUntil then
+        rankPermissionAPI, rankPermissions, rankPermissionUntil = fn, {}, now + 5
+        U.rankPermissionRevision = (U.rankPermissionRevision or 0) + 1
+        if U.ElectionChanged then U.ElectionChanged() end
+    end
+    return rankPermissionUntil
+end
 function U.RankIsOfficer(rank)
     if not U.Public(rank) or type(rank) ~= "number" or rank < 0 or rank > 9 or rank ~= math.floor(rank) then return false end
     if rank == 0 then return true end
     -- Forever's OfficerCheckbox uses permission 22; roster ranks start at zero,
     -- while GuildControlGetRankFlags takes a one-based order. Do not change the
     -- guild-control UI selection or infer authority from names/invitation rights.
-    local fn = C_GuildInfo and C_GuildInfo.GuildControlGetRankFlags
+    U.RankPermissionsCurrent()
+    if rankPermissions[rank] ~= nil then return rankPermissions[rank] end
+    local fn = rankPermissionAPI
     if type(fn) ~= "function" then return false end
     local ok, flags = pcall(fn, rank + 1)
-    if not ok or not U.Public(flags) or type(flags) ~= "table" then return false end
-    return U.Public(flags[22]) and flags[22] == true
+    if not ok or not U.Public(flags) or type(flags) ~= "table" then rankPermissions[rank] = false; return false end
+    local allowed = U.Public(flags[22]) and flags[22] == true
+    rankPermissions[rank] = allowed
+    return allowed
 end
 function U.IsVeteranRankName(rankName)
     return U.Text(rankName, 120) and U.Fold(U.Trim(rankName)) == U.Fold("Ветеран")
@@ -184,7 +204,9 @@ function U.RowCanRelay(row)
     return type(row) == "table" and (row.rank == 0 or row.officer == true or U.IsVeteranRankName(row.rankName)) or false
 end
 function U.IsOfficer()
-    local row = U.guild and U.own and U.own[U.me]
+    local row
+    if U.AuthorityRow then row = U.AuthorityRow(U.me)
+    else row = U.guild and U.own and U.own[U.me] end
     if not row or not U.RankIsOfficer(row.rank) then return false end
     if row.rank == 0 then return true end
     local fn = C_GuildInfo and C_GuildInfo.IsGuildOfficer or IsGuildOfficer

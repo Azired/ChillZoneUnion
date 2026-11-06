@@ -18,13 +18,13 @@ end
 function U.OtherGuild() return U.guild == 1 and 2 or 1 end
 function U.IsTrustOfficer(name)
     name = name or U.me
-    local row = U.guild and U.own and U.own[name]
+    local row = U.AuthorityRow(name)
     if not row or not U.RosterFresh(U.guild) then return false end
     return name == U.me and U.IsOfficer() or name ~= U.me and U.RankIsOfficer(row.rank)
 end
 function U.CanRelay(name)
     name = name or U.me
-    local row = U.guild and U.own and U.own[name]
+    local row = U.AuthorityRow(name)
     return row ~= nil and U.RosterFresh(U.guild) and (U.IsTrustOfficer(name) or U.IsVeteranRankName(row.rankName)) or false
 end
 local function FreshForeignRejection(name, guild)
@@ -70,6 +70,7 @@ local function Contact(name, guild, share, approve)
         return a.name < b.name
     end)
     for i = 31, #contacts do U.db.contacts[contacts[i].name] = nil end
+    if U.ElectionChanged then U.ElectionChanged(U.me) end
     if share and (fresh or approve) and U.IsTrustOfficer() then U.Queue("CONTACT", { name, guild }, "GUILD", nil, true) end
     return true
 end
@@ -77,8 +78,11 @@ function U.AddContact(name, guild, share) return Contact(name, guild, share, fal
 function U.ApproveContact(name, guild, share) return Contact(name, guild, share, true) end
 local function PairReady(name)
     name = name or U.me
+    if name ~= U.me then
+        local peer = U.peers[name]
+        return peer ~= nil and peer.pairReady == true and U.CanRelay(name) or false
+    end
     if not U.CanRelay(name) then return false end
-    if name ~= U.me then return U.peers[name] and U.peers[name].pairReady == true or false end
     for _, contact in pairs(U.db.contacts) do
         if contact.approved == true and contact.guild == U.OtherGuild() then return true end
     end
@@ -114,38 +118,129 @@ function U.LearnRosterContacts(guild, rows)
         return a < b
     end)
     for i = 1, math.min(30, #names) do U.ApproveContact(names[i], guild) end
+    if U.ElectionChanged then U.ElectionChanged(U.me) end
 end
 local function Alive(name)
     if not name or not U.guild then return false end
-    local row = U.own[name]
+    local row = U.AuthorityRow(name)
     if not row or not row.online then return false end
     if name == U.me then return true end
     local p = U.peers[name]
     return p and p.guild == U.guild and U.clock() - p.at < PEER_FOR
 end
+-- Maintain both election orders incrementally. HELLO changes one entry; ticks
+-- read the elected heap root rather than walking every installed member.
+local electionDirty, indexedPeers, indexedOwn, indexedGuild, indexedMe = true
+local indexedRemote, indexedSince, indexedRanks
+local alphabetical = { rows = {}, positions = {}, connected = false }
+local established = { rows = {}, positions = {}, connected = true }
+local function Before(heap, a, b)
+    if heap.connected and a.since ~= b.since then return a.since < b.since end
+    return a.name < b.name
+end
+local function Swap(heap, a, b)
+    local rows = heap.rows
+    rows[a], rows[b] = rows[b], rows[a]
+    heap.positions[rows[a].name], heap.positions[rows[b].name] = a, b
+end
+local function Restore(heap, index)
+    while index > 1 do
+        local parent = math.floor(index / 2)
+        if not Before(heap, heap.rows[index], heap.rows[parent]) then break end
+        Swap(heap, index, parent); index = parent
+    end
+    while true do
+        local child = index * 2
+        if child > #heap.rows then break end
+        if child < #heap.rows and Before(heap, heap.rows[child + 1], heap.rows[child]) then child = child + 1 end
+        if not Before(heap, heap.rows[child], heap.rows[index]) then break end
+        Swap(heap, index, child); index = child
+    end
+end
+local function RemoveCandidate(heap, name)
+    local index, rows = heap.positions[name], heap.rows
+    if not index then return end
+    heap.positions[name] = nil
+    local last = table.remove(rows)
+    if index <= #rows then rows[index], heap.positions[last.name] = last, index; Restore(heap, index) end
+end
+local function InsertCandidate(heap, entry)
+    local index = #heap.rows + 1
+    heap.rows[index], heap.positions[entry.name] = entry, index
+    Restore(heap, index)
+end
+local function UpdateCandidate(name)
+    RemoveCandidate(alphabetical, name); RemoveCandidate(established, name)
+    if not PairReady(name) or not Alive(name) then return end
+    local peer, now = U.peers[name], U.clock()
+    local entry = { name = name, expires = name == U.me and math.huge or peer.at + PEER_FOR }
+    InsertCandidate(alphabetical, entry)
+    if name == U.me then
+        if not U.remote or now - U.remote.at >= PEER_FOR or not U.gatewaySince then return end
+        entry.since, entry.connectionExpires = U.gatewaySince, U.remote.at + PEER_FOR
+    elseif peer.remote and peer.leader == name then
+        entry.since, entry.connectionExpires = peer.since or 0, entry.expires
+    else return end
+    InsertCandidate(established, entry)
+end
+function U.ElectionChanged(name)
+    if not name or electionDirty or indexedPeers ~= U.peers or indexedOwn ~= U.own
+        or indexedGuild ~= U.guild or indexedMe ~= U.me then electionDirty = true; return end
+    UpdateCandidate(name)
+end
+local function EnsureElection()
+    U.RankPermissionsCurrent()
+    if electionDirty or indexedPeers ~= U.peers or indexedOwn ~= U.own or indexedGuild ~= U.guild
+        or indexedMe ~= U.me or indexedRanks ~= U.rankPermissionRevision then
+        alphabetical.rows, alphabetical.positions, established.rows, established.positions = {}, {}, {}, {}
+        UpdateCandidate(U.me)
+        for name in pairs(U.peers) do if name ~= U.me then UpdateCandidate(name) end end
+        indexedPeers, indexedOwn, indexedGuild, indexedMe = U.peers, U.own, U.guild, U.me
+        indexedRanks, electionDirty = U.rankPermissionRevision, false
+    end
+    if indexedRemote ~= U.remote or indexedSince ~= U.gatewaySince then
+        indexedRemote, indexedSince = U.remote, U.gatewaySince
+        UpdateCandidate(U.me)
+    end
+end
+local function ValidCandidate(entry, connected)
+    return entry.expires > U.clock() and (not connected or entry.connectionExpires > U.clock())
+        and PairReady(entry.name) and Alive(entry.name)
+end
+local function Elected(heap)
+    while heap.rows[1] do
+        local entry = heap.rows[1]
+        if ValidCandidate(entry, heap.connected) then return entry.name end
+        UpdateCandidate(entry.name)
+    end
+end
 function U.GatewayName()
     if not U.guild or not Alive(U.me) then return nil end
-    local best, since
-    local function Consider(name, started)
-        if not best or started < since or (started == since and name < best) then best, since = name, started end
-    end
-    if PairReady() and U.remote and U.clock() - U.remote.at < PEER_FOR and U.gatewaySince then Consider(U.me, U.gatewaySince) end
-    for name, p in pairs(U.peers) do
-        if PairReady(name) and Alive(name) and p.remote and p.leader == name then Consider(name, p.since or 0) end
-    end
-    if best then return best end
-    best = PairReady() and U.me or nil
-    for name in pairs(U.peers) do if PairReady(name) and Alive(name) and (not best or name < best) then best = name end end
-    return best
+    EnsureElection()
+    return Elected(established) or Elected(alphabetical)
 end
 function U.IsGateway() return U.guild ~= nil and U.GatewayName() == U.me end
 function U.CandidateNames()
-    local names = {}
-    if PairReady() and Alive(U.me) then names[1] = U.me end
-    for name in pairs(U.peers) do if PairReady(name) and Alive(name) then names[#names + 1] = name end end
-    table.sort(names)
-    while #names > 8 do table.remove(names) end
-    return U.Pack(names)
+    if not U.guild or not Alive(U.me) then return U.Pack({}) end
+    EnsureElection()
+    -- Find the first eight names through a bounded heap frontier.
+    -- Expired candidates are removed lazily, including ones outside the winner.
+    while true do
+        local names, frontier, retry = {}, #alphabetical.rows > 0 and { 1 } or {}, false
+        while #frontier > 0 and #names < 8 do
+            local best = 1
+            for i = 2, #frontier do
+                if alphabetical.rows[frontier[i]].name < alphabetical.rows[frontier[best]].name then best = i end
+            end
+            local index = table.remove(frontier, best)
+            local entry = alphabetical.rows[index]
+            if not ValidCandidate(entry, false) then UpdateCandidate(entry.name); retry = true; break end
+            names[#names + 1] = entry.name
+            if alphabetical.rows[index * 2] then frontier[#frontier + 1] = index * 2 end
+            if alphabetical.rows[index * 2 + 1] then frontier[#frontier + 1] = index * 2 + 1 end
+        end
+        if not retry then return U.Pack(names) end
+    end
 end
 function U.LearnCandidates(raw, guild)
     local names = U.Unpack(raw, 8)
@@ -180,6 +275,7 @@ function U.NetworkReset()
     U.links, U.inboundLinks, U.probes, U.pings = {}, {}, {}, {}
     U.own = {}
     U.ClearQueue()
+    if U.ElectionChanged then U.ElectionChanged() end
     lastHello, lastPing, U.snapshotDue = -100, -100, 0
 end
 function U.SayHello()
@@ -231,6 +327,7 @@ function U.SetRemote(name, paired)
     local changed = not U.remote or U.remote.name ~= name
     if not U.gatewaySince then U.gatewaySince = U.stamp() end
     U.remote = { name = name, at = U.clock() }
+    if U.ElectionChanged then U.ElectionChanged(U.me) end
     U.linkState = { name = name, gateway = U.me, at = U.clock() }
     U.AddContact(name, U.OtherGuild(), changed)
     if changed then
@@ -680,7 +777,11 @@ local function KnownAuthor(name, guild)
     local rows = guild == U.guild and U.own or cache and cache.rows
     return rows ~= nil and rows[name] ~= nil
 end
-function U.HandleRemote(kind, f, source, direct)
+function U.HandleRemote(kind, f, source, direct, context)
+    -- A guildless transfer participant is authenticated by the accepted ticket,
+    -- never promoted to a general foreign relay. Wrapped packets also bind the
+    -- server-stamped local gateway passed by Handle below.
+    if kind == "READY" then return U.TransferMessage(kind, f, source, true, context) end
     local guild = U.TrustedPeer(source)
     if not guild then return false end
     if kind == "ADDONS" then return U.PresenceMessage and U.PresenceMessage(kind, f, source, true) == true or false end
@@ -708,13 +809,22 @@ function U.HandleRemote(kind, f, source, direct)
         end
         if not ValidateRecord(f, recordGuild) then return false end
         if not KnownAuthor(U.Name(f[2]), recordGuild) then return false end
-        ShowRecord(f, kind == "HREC" and recordGuild == U.guild, "delivered", kind == "HREC")
         if direct and kind == "CHAT" then
-            U.Queue("ACK", { guild, f[4] }, "WHISPER", source, true, false, nil, true, U.clock() + OUTBOX_FOR)
+            if not U.IsGateway() then return false end
+            local expires = U.clock() + OUTBOX_FOR
+            -- Reserve the guild broadcast and its receipt together. A full
+            -- queue must leave the sender's retry state pending.
+            if not U.QueueBatch({
+                { kind = "REMOTE", fields = { kind, U.Pack(f), source }, dist = "GUILD", priority = true,
+                    logged = true, requiresGateway = true, expiresAt = expires },
+                { kind = "ACK", fields = { guild, f[4] }, dist = "WHISPER", target = source, priority = true,
+                    requiresGateway = true, expiresAt = expires },
+            }) then return false end
         end
+        ShowRecord(f, kind == "HREC" and recordGuild == U.guild, "delivered", kind == "HREC")
         return true
     end
-    if U.TransferMessage(kind, f, source, true) then return true end
+    if U.TransferMessage(kind, f, source, true, context) then return true end
     return U.ExtensionMessage and U.ExtensionMessage(kind, f, source, true) == true or false
 end
 function U.Handle(kind, f, dist, sender, id)
@@ -737,7 +847,8 @@ function U.Handle(kind, f, dist, sender, id)
             end end
             if not U.CanRelay(sender) or not remote or U.TrustedPeer(remote) ~= U.OtherGuild() then remote = nil end
             U.peers[sender] = { at = U.clock(), guild = U.guild, remote = remote, leader = leader, since = since,
-                pairReady = #f == 7 and f[7] == "1" and U.CanRelay(sender) }
+                pairReady = #f == 7 and f[7] == "1" }
+            if U.ElectionChanged then U.ElectionChanged(sender) end
             if U.PresenceHello then U.PresenceHello(sender, f[2]) end
             local gateway = U.GatewayName()
             if sender == gateway then
@@ -761,7 +872,7 @@ function U.Handle(kind, f, dist, sender, id)
         elseif kind == "REMOTE" then
             if #f ~= 3 or sender ~= U.GatewayName() then return end
             local fields = U.Unpack(f[2])
-            if fields then U.HandleRemote(f[1], fields, U.Name(f[3])) end
+            if fields then U.HandleRemote(f[1], fields, U.Name(f[3]), false, { gateway = sender }) end
         elseif U.HandleOwn(kind, f, sender) and kind ~= "CHAT" and kind ~= "NATIVE" and U.IsGateway() and U.Connected() then
             U.Queue(kind, f, "WHISPER", U.remote.name, true, IsTextKind(kind), nil, true)
         end
@@ -809,11 +920,15 @@ function U.Handle(kind, f, dist, sender, id)
     elseif U.IsGateway() then
         local key = sender .. ":" .. id
         if remoteSeen[key] then return end
-        remoteSeen[key] = U.clock()
         if U.HandleRemote(kind, f, sender, true) then
             local priority = kind ~= "ROSTER" and kind ~= "DELTA" and kind ~= "HREC" and kind ~= "ADDONS"
-            U.Queue("REMOTE", { kind, U.Pack(f), sender }, "GUILD", nil, priority, IsTextKind(kind), nil, true,
+            -- Direct CHAT already committed its REMOTE+ACK atomically above.
+            local queued = kind == "CHAT" or U.Queue("REMOTE", { kind, U.Pack(f), sender }, "GUILD", nil, priority, IsTextKind(kind), nil, true,
                 kind == "HREC" and U.clock() + OUTBOX_FOR or nil)
+            if queued then
+                remoteSeen[key] = U.clock()
+                if U.TransferRelayQueued then U.TransferRelayQueued(kind, f, sender) end
+            end
         end
     end
 end
@@ -832,6 +947,7 @@ function U.NetworkTick()
     if now - lastHello > 20 then U.SayHello() end
     if U.remote and now - U.remote.at > PEER_FOR then
         U.remote, U.gatewaySince = nil, nil
+        if U.ElectionChanged then U.ElectionChanged(U.me) end
         if U.linkState and U.linkState.gateway == U.me then U.linkState = nil end
     end
     local gateway = U.GatewayName()
