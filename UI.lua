@@ -38,6 +38,7 @@ local function Edit(parent, x, y, width, hint)
 end
 local Native = {}
 local Level = { rows = {}, offset = 0, step = 10, scope = 0, mode = "total" }
+local Overview = { rows = {}, cards = {}, offset = 0, scope = 0 }
 function Native.HasMethod(object, method)
     local kind = type(object)
     return (kind == "table" or kind == "userdata") and type(object[method]) == "function"
@@ -77,6 +78,7 @@ function Native.RowArt(button, index)
 end
 function Native.ClearPageFocus()
     if Level.hover then Level.hover = nil; GameTooltip:Hide() end
+    if Overview.hover then Overview.hover = nil; GameTooltip:Hide() end
     for _, edit in pairs({ search = search, chat = chatBox, contact = contact, announcement = announcementEdit }) do
         if edit:HasFocus() then edit:ClearFocus() end
     end
@@ -373,8 +375,12 @@ RenderRoster = function()
             total = total + 1
             if fresh[guild] and row.online then online = online + 1 end
             local text = U.Fold(row.name .. " " .. Class(row).label .. " " .. (row.rankName or "") .. " " .. (row.zone or ""))
+            local location = Overview.location
+            local zone = type(row.zone) == "string" and U.Trim(row.zone) or ""
+            local locationMatches = not location or (fresh[guild] and row.online == true
+                and (location.unknown and zone == "" or not location.unknown and U.Fold(zone) == location.key))
             if (guildFilter == 0 or guildFilter == guild) and (offline:GetChecked() or not fresh[guild] or row.online)
-                and (needle == "" or text:find(needle, 1, true)) then all[#all + 1] = row end
+                and locationMatches and (needle == "" or text:find(needle, 1, true)) then all[#all + 1] = row end
         end
         memberTotal, onlineTotal = memberTotal + total, onlineTotal + online
         if not fresh[guild] then unknownOnline = true; if known then cached = true end end
@@ -461,6 +467,7 @@ RenderRoster = function()
     if rosterContext and (not rosterContext.owner.row or rosterContext.owner.row.name ~= rosterContext.name
         or rosterContext.owner.row.guild ~= rosterContext.guild) then U.CloseRosterContextMenu() end
     if hovered then ShowRosterTooltip(hovered) end
+    Native.RefreshLocationFilter()
 end
 local states = { proposed = "Ожидает согласия", accepted = "Согласен; ждёт выхода", ready = "Можно пригласить", declined = "Отказ", done = "Завершён" }
 local function TicketPriority(t)
@@ -702,6 +709,169 @@ function Native.BuildLevelStats(body)
     local note = Label(p, "? — данные неизвестны. Неполные полосы показывают известную часть.\nНаведите на строку для сводки по обеим гильдиям.", 280, -450, 670, "GameFontHighlightSmall")
     note:SetHeight(34); note:SetJustifyV("TOP")
 end
+function Native.ClearLocationFilter(refresh)
+    Overview.location = nil
+    Native.RefreshLocationFilter()
+    if refresh and window then offset = 0; RenderRoster() end
+end
+function Native.RefreshLocationFilter()
+    if not Overview.filterButton then return end
+    local location = Overview.location
+    Overview.filterButton:SetShown(location ~= nil); Overview.filterNote:SetShown(location ~= nil)
+    if location then
+        Overview.filterButton:SetText((location.unknown and "Локация не указана" or ("Локация: " .. U.SafeDisplay(location.name))) .. " — сбросить")
+    end
+end
+function Native.BuildLocationFilter(parent)
+    Overview.filterButton = Button(parent, "", 0, -482, 530, function() Native.ClearLocationFilter(true) end)
+    Overview.filterButton.czuLocationClear = true
+    Overview.filterNote = Label(parent, "Только участники онлайн со свежими данными.", 545, -488, 405, "GameFontHighlightSmall")
+    Native.RefreshLocationFilter()
+end
+function Native.OverviewCount(zone)
+    if Overview.scope == 0 then return zone.online, zone.knownOnline end
+    local value = zone.guilds[Overview.scope].online
+    return value, value or 0
+end
+function Native.OverviewTooltip(frame)
+    local row = frame.zoneRow
+    if not row then return end
+    Overview.hover = frame
+    GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
+    GameTooltip:SetText(row.unknown and "Локация не указана" or U.SafeDisplay(row.name), 1, 0.82, 0)
+    for guild = 1, 2 do
+        GameTooltip:AddLine(U.SafeDisplay(U.GUILDS[guild]) .. ": " .. ClassCount(row.guilds[guild].online), 0.85, 0.87, 0.9)
+    end
+    GameTooltip:AddLine("Всего онлайн: " .. ClassCount(row.online, row.knownOnline), 1, 1, 1)
+    GameTooltip:AddLine("Нажмите, чтобы открыть участников этой локации.", 0.65, 0.68, 0.72)
+    GameTooltip:Show()
+end
+function Native.OverviewScroll(_, delta)
+    Overview.offset = Overview.offset - delta * 3
+    Native.RenderOverview()
+end
+function Native.RenderOverview()
+    if not Overview.page then return end
+    local data = U.OverviewStatistics()
+    Overview.data = data
+    Overview.summary:SetText("В сети / всего: " .. ClassCountPair(data) .. "     •     " .. Connection())
+    for guild, frame in ipairs(Overview.cards) do
+        local state = data.guilds[guild]
+        frame.guildSummary = state
+        frame.counts:SetText("В сети / всего: " .. ClassCountPair(state))
+        frame.state:SetText(not state.known and "Нет данных" or (state.fresh and "Актуально" or ("Сохранено " .. Age(state.at))))
+        frame.levels:SetText("Средний ур.: " .. (state.avgLevel and ("%.1f"):format(state.avgLevel) or "?") .. "     Максимальный: " .. (state.maxLevel or "?")
+            .. (state.levelComplete == false and state.levelCount > 0 and (" (по " .. state.levelCount .. ")") or ""))
+        frame.leader:SetText("Глава: " .. U.SafeDisplay(state.leader or "нет данных"))
+        if state.addonCount ~= nil then
+            frame.addons:SetText("Аддон подтверждён: " .. state.addonCount .. (state.addonUnknownOnline > 0 and ("; не проверено: " .. state.addonUnknownOnline) or " (все онлайн)"))
+        else frame.addons:SetText("Аддон: нет свежих подтверждений") end
+    end
+    local locations = {}
+    for _, row in ipairs(data.zones) do
+        local _, known = Native.OverviewCount(row)
+        if known > 0 then locations[#locations + 1] = { zone = row, count = known } end
+    end
+    table.sort(locations, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        return a.zone.key < b.zone.key
+    end)
+    Overview.offset = math.max(0, math.min(Overview.offset, math.max(0, #locations - #Overview.rows)))
+    local peak = #locations > 0 and math.max(1, locations[1].count) or 1
+    Overview.scopeButton:SetText(Overview.scope == 0 and "Весь союз" or U.GUILDS[Overview.scope])
+    Overview.range:SetText((#locations > 0 and Overview.offset + 1 or 0) .. "–" .. math.min(Overview.offset + #Overview.rows, #locations) .. " из " .. #locations)
+    Enable(Overview.previous, Overview.offset > 0)
+    Enable(Overview.next, Overview.offset + #Overview.rows < #locations)
+    Overview.empty:SetShown(#locations == 0)
+    local state = Overview.scope == 0 and data or data.guilds[Overview.scope]
+    Overview.empty:SetText(state.online == nil and "Ожидаем свежие данные о локациях." or "Нет участников онлайн.")
+    if U.UnionMapPinsEnabled then Overview.pins:SetChecked(U.UnionMapPinsEnabled()) end
+    if U.UnionMapStatus then
+        local map = U.UnionMapStatus(data)
+        Overview.mapState:SetText(not map.enabled and "Метки союза на карте выключены."
+            or (not map.available and (map.reason or "Карта этого клиента недоступна."))
+            or (map.unmappedZones and map.unmappedZones > 0 and ("Зон без привязки к карте: " .. map.unmappedZones))
+            or "Метки показывают численность в центре локации.")
+    end
+    for index, frame in ipairs(Overview.rows) do
+        local item = locations[Overview.offset + index]
+        frame.zoneRow = item and item.zone or nil; frame:SetShown(item ~= nil)
+        if item then
+            local row = item.zone
+            local value, known = Native.OverviewCount(row)
+            frame.name:SetText(row.unknown and "Локация не указана" or U.SafeDisplay(row.name))
+            frame.count:SetText(ClassCount(value, known))
+            frame.bar:SetMinMaxValues(0, peak); frame.bar:SetValue(known)
+            frame.bar:SetStatusBarColor(0.25, 0.67, 0.82)
+        end
+    end
+    if Overview.hover then Native.OverviewTooltip(Overview.hover) end
+end
+function Native.BuildOverview(body)
+    local p = pages.overview
+    _G.ChillZoneUnionOverview = p
+    Overview.page = p
+    Label(p, "Обзор союза", 0, -4, 450, "GameFontNormalLarge")
+    Button(p, "Классы", 490, 0, 105, function() U.OpenClassStats() end).czuOverviewAction = "classes"
+    Button(p, "Уровни", 605, 0, 105, function() U.OpenLevelStats() end).czuOverviewAction = "levels"
+    Button(p, "Карта мира", 720, 0, 110, function()
+        if U.OpenUnionMap and U.OpenUnionMap() then window:Hide()
+        else U.Print("Карта пока недоступна. Локации можно посмотреть в «Обзоре».") end
+    end).czuOverviewAction = "map"
+    Button(p, "Обновить", 840, 0, 110, function()
+        U.RequestRoster(); U.snapshotDue = 0; if U.MarkMapDirty then U.MarkMapDirty() end; Native.RenderOverview()
+    end).czuOverviewAction = "refresh"
+    for guild = 1, 2 do
+        local frame = CreateFrame("Frame", nil, p)
+        frame:SetSize(465, 120); frame:SetPoint("TOPLEFT", (guild - 1) * 485, -42)
+        Native.Inset(frame, 0, 0, 465, 120)
+        Label(frame, U.GUILDS[guild], 12, -10, 245, "GameFontNormal")
+        frame.state = Label(frame, "", 265, -12, 188, "GameFontHighlightSmall")
+        frame.counts = Label(frame, "", 12, -35, 441, "GameFontHighlight")
+        frame.levels = Label(frame, "", 12, -59, 441, "GameFontHighlightSmall")
+        frame.leader = Label(frame, "", 12, -78, 441, "GameFontHighlightSmall")
+        frame.addons = Label(frame, "", 12, -96, 441, "GameFontHighlightSmall")
+        Overview.cards[guild] = frame
+    end
+    Overview.summary = Label(p, "", 0, -176, 950, "GameFontHighlightSmall")
+    Overview.scopeButton = Button(p, "Весь союз", 0, -204, 245, function()
+        Overview.scope = (Overview.scope + 1) % 3; Overview.offset = 0; Native.RenderOverview()
+    end); Overview.scopeButton.czuOverviewAction = "scope"
+    Overview.pins = CreateFrame("CheckButton", nil, p, "UICheckButtonTemplate")
+    Overview.pins:SetSize(24, 24); Overview.pins:SetPoint("TOPLEFT", 270, -204); Overview.pins.czuOverviewAction = "pins"
+    Label(p, "Метки союза на карте", 298, -211, 280, "GameFontHighlightSmall")
+    Overview.pins:SetScript("OnClick", function(self) if U.SetUnionMapPins then U.SetUnionMapPins(self:GetChecked() == true) end; Native.RenderOverview() end)
+    Overview.mapState = Label(p, "Метки показывают численность в зоне.", 580, -211, 370, "GameFontHighlightSmall")
+    Native.Inset(p, -8, -236, 966, 232)
+    Label(p, "Локация — нажмите для списка", 10, -242, 310, "GameFontNormal")
+    Label(p, "Участники онлайн", 330, -242, 380, "GameFontNormal")
+    Label(p, "Количество", 725, -242, 210, "GameFontNormal")
+    for i = 1, 8 do
+        local frame = CreateFrame("Button", nil, p)
+        frame:SetSize(950, 22); frame:SetPoint("TOPLEFT", 0, -268 - (i - 1) * 24)
+        Native.RowArt(frame, i)
+        frame.name = Label(frame, "", 10, -5, 310, "GameFontHighlightSmall")
+        frame.bar = CreateFrame("StatusBar", nil, frame)
+        frame.bar:SetSize(380, 13); frame.bar:SetPoint("LEFT", 330, 0)
+        frame.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar"); frame.bar:EnableMouse(false)
+        frame.count = Label(frame, "", 725, -5, 210, "GameFontHighlightSmall")
+        frame:SetScript("OnClick", function(self) if self.zoneRow then U.OpenLocationRoster(not self.zoneRow.unknown and self.zoneRow.name or nil, Overview.scope) end end)
+        frame:SetScript("OnEnter", Native.OverviewTooltip)
+        frame:EnableMouseWheel(true); frame:SetScript("OnMouseWheel", Native.OverviewScroll)
+        local function Leave() if Overview.hover == frame then Overview.hover = nil; GameTooltip:Hide() end end
+        frame:SetScript("OnLeave", Leave); frame:SetScript("OnHide", Leave)
+        Overview.rows[i] = frame
+    end
+    Overview.empty = Label(p, "", 10, -286, 925, "GameFontHighlightSmall")
+    Overview.previous = Button(p, ArrowText("left"), 0, -479, 40, function() Overview.offset = Overview.offset - #Overview.rows; Native.RenderOverview() end)
+    Overview.previous.czuOverviewAction = "previous"
+    Overview.range = Label(p, "", 55, -485, 150, "GameFontHighlightSmall")
+    Overview.next = Button(p, ArrowText("right"), 220, -479, 40, function() Overview.offset = Overview.offset + #Overview.rows; Native.RenderOverview() end)
+    Overview.next.czuOverviewAction = "next"
+    p.range = Overview.range; p.summary = Overview.summary; p.empty = Overview.empty
+    p:EnableMouseWheel(true); p:SetScript("OnMouseWheel", Native.OverviewScroll)
+    p:SetScript("OnHide", function() if Overview.hover then Overview.hover = nil; GameTooltip:Hide() end end)
+end
 function U.BuildLinkApprovalControls(parent)
     local controls = {}
     controls.share = Button(parent, "Передать настройки", 350, -2, 215, function() U.ShareTrust() end)
@@ -813,12 +983,14 @@ function U.RefreshChat()
     UpdateUnread()
 end
 function U.Refresh()
+    if U.MarkMapDirty then U.MarkMapDirty() end
     RefreshConnection()
     if not window or not window:IsShown() then return end
     local state = Connection()
     status:SetText(state .. "  •  Общий чат: /czu текст  •  Подробности — «Связь»")
     RenderAnnouncement()
     if page == "roster" then RenderRoster()
+    elseif page == "overview" then Native.RenderOverview()
     elseif page == "stats" then RenderClassStats()
     elseif page == "levels" then Native.RenderLevelStats()
     elseif page == "transfers" then RenderTickets()
@@ -874,18 +1046,18 @@ Build = function()
         close = CreateFrame("Button", nil, window, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -6, -5)
     end
     close:SetScript("OnClick", function() window:Hide() end)
-    local definitions = { { "roster", "Состав", 110 }, { "chat", "Общий чат", 160 }, { "transfers", "Переходы", 125 }, { "link", "Связь", 110 } }
+    local definitions = { { "overview", "Обзор", 100, 5 }, { "roster", "Состав", 110, 1 }, { "chat", "Общий чат", 160, 2 }, { "transfers", "Переходы", 125, 3 }, { "link", "Связь", 110, 4 } }
     local previous
     for index, tab in ipairs(definitions) do
         local key = tab[1]
-        local button = Native.Frame("Button", "ChillZoneUnionWindowTab" .. index, window,
+        local button = Native.Frame("Button", "ChillZoneUnionWindowTab" .. tab[4], window,
             { "PanelTabButtonTemplate", "CharacterFrameTabButtonTemplate", "TabButtonTemplate" })
         if button then
             button.czuNative = true
         else
             button = CreateFrame("Button", nil, window, "UIPanelButtonTemplate")
         end
-        button:SetID(index); button:SetSize(tab[3], 32); button:SetText(tab[2])
+        button:SetID(tab[4]); button:SetSize(tab[3], 32); button:SetText(tab[2])
         button:SetScript("OnClick", function() Switch(key) end)
         if previous then
             local modern = Native.HasMethod(button.LeftActive, "Show") and type(PanelTemplates_AnchorTabs) == "function"
@@ -903,7 +1075,7 @@ Build = function()
     counts = Label(r, "", 0, 0, 950, "GameFontNormalLarge")
     guildCounts = Label(r, "", 0, -21, 950, "GameFontHighlightSmall")
     search = Edit(r, 7, -60, 280, "Имя, класс, звание или локация")
-    search:SetScript("OnTextChanged", function() U.CloseRosterContextMenu(); offset = 0; RenderRoster() end)
+    search:SetScript("OnTextChanged", function() U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster() end)
     guildButton = Button(r, "Весь союз", 310, -61, 180, function()
         U.CloseRosterContextMenu()
         guildFilter = (guildFilter + 1) % 3; offset = 0
@@ -911,7 +1083,7 @@ Build = function()
     end)
     offline = CreateFrame("CheckButton", nil, r, "UICheckButtonTemplate"); offline:SetSize(24, 24); offline:SetPoint("TOPLEFT", 510, -60)
     Label(r, "Показывать офлайн", 538, -67, 160, "GameFontHighlightSmall")
-    offline:SetScript("OnClick", function() U.CloseRosterContextMenu(); offset = 0; RenderRoster() end)
+    offline:SetScript("OnClick", function() U.CloseRosterContextMenu(); Native.ClearLocationFilter(); offset = 0; RenderRoster() end)
     Button(r, "Обновить", 820, -61, 130, function() U.RequestRoster(); U.snapshotDue = 0 end)
     Button(r, "Статистика", 705, -61, 105, function() U.OpenClassStats() end)
     Native.Inset(r, -8, -94, 966, 320)
@@ -968,9 +1140,11 @@ Build = function()
     Button(r, "Шёпот", 645, -416, 100, function() if selected then ChatFrame_OpenChat("/w " .. selected.name .. " ") end end)
     r.move = Button(r, "Предложить переход", 755, -416, 195, function() if selected then U.CreateTransfer(selected.name, selected.guild); ticketOffset = 0; Switch("transfers") end end)
     r.selection = Label(r, "", 0, -453, 950, "GameFontHighlightSmall")
+    Native.BuildLocationFilter(r)
 
     BuildClassStats(stats)
     Native.BuildLevelStats(body)
+    Native.BuildOverview(body)
 
     local c = pages.chat
     Native.Inset(c, -8, 8, 966, 44)
@@ -1123,6 +1297,24 @@ function U.OpenLevelStats()
     if not window then Build() end
     Level.offset = 0
     window:Show(); Switch("levels")
+end
+function U.OpenOverview()
+    if not U.db then return end
+    if not window then Build() end
+    Overview.offset = 0
+    window:Show(); Switch("overview")
+end
+function U.OpenLocationRoster(name, scope)
+    if not U.db or (name ~= nil and not U.Text(name, 500)) then return false end
+    if not window then Build() end
+    local label = name and U.Trim(name) or ""
+    if scope ~= 1 and scope ~= 2 then scope = 0 end
+    search:SetText(""); offline:SetChecked(false)
+    guildFilter, offset, selected = scope, 0, nil
+    guildButton:SetText(scope == 0 and "Весь союз" or U.GUILDS[scope])
+    Overview.location = { name = label, key = U.Fold(label), unknown = label == "" }
+    window:Show(); Switch("roster")
+    return true
 end
 
 local setupIntroPending = false

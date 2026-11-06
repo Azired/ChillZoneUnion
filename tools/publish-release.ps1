@@ -61,13 +61,13 @@ function Find-Release {
     throw 'Release discovery exceeded its pagination limit.'
 }
 function Zip-Blobs {
-    $allowed = @('Bindings.xml','Chat.lua','ChillZoneUnion.toc','Core.lua','LICENSE.txt','Network.lua','Presence.lua','Protocol.lua','README.txt','Roster.lua','SECURITY.txt','Stats.lua','Transfers.lua','UI.lua','Union.lua',
-        'Libs/LibDeflate.lua','Libs/LibStub.lua','Media/arrow-down.tga','Media/arrow-left.tga','Media/arrow-right.tga','Media/arrow-up.tga','Media/minimap.tga','Media/status-dot.tga')
+    $allowed = @('Bindings.xml','Chat.lua','ChillZoneUnion.toc','Core.lua','LICENSE.txt','Map.lua','Network.lua','Presence.lua','Protocol.lua','README.txt','Roster.lua','SECURITY.txt','Stats.lua','Transfers.lua','UI.lua','Union.lua',
+        'Libs/CallbackHandler-1.0.lua','Libs/HereBeDragons-2.0.lua','Libs/HereBeDragons-Pins-2.0.lua','Libs/LICENSE-Ace3.txt','Libs/LICENSE-HereBeDragons.txt','Libs/LibDeflate.lua','Libs/LibStub.lua','Media/arrow-down.tga','Media/arrow-left.tga','Media/arrow-right.tga','Media/arrow-up.tga','Media/minimap.tga','Media/status-dot.tga')
     $blobs = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     $hasher = [Security.Cryptography.SHA1]::Create()
     try {
-        if ($zip.Entries.Count -ne 23) { throw 'The ZIP must contain exactly 23 addon files.' }
+        if ($zip.Entries.Count -ne 29) { throw 'The ZIP must contain exactly 29 addon files.' }
         foreach ($entry in $zip.Entries) {
             if (-not $entry.FullName.StartsWith('ChillZoneUnion/', [StringComparison]::Ordinal)) { throw 'The ZIP has an unexpected top-level folder.' }
             $relative = $entry.FullName.Substring('ChillZoneUnion/'.Length)

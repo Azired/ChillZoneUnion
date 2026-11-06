@@ -2,11 +2,14 @@
 ## Title: Чиллзон — Союз гильдий
 ## Notes: Общий чат, состав и согласованные переходы между Чиллзон и Чиллзон Навсегда.
 ## Author: Petukhov A.V.
-## Version: 0.8.0-beta
+## Version: 0.9.0-beta
 ## IconTexture: Interface\AddOns\ChillZoneUnion\Media\minimap
 ## SavedVariables: ChillZoneUnionDB
 
 Libs\LibStub.lua
+Libs\CallbackHandler-1.0.lua
+Libs\HereBeDragons-2.0.lua
+Libs\HereBeDragons-Pins-2.0.lua
 Libs\LibDeflate.lua
 Core.lua
 Chat.lua
@@ -18,4 +21,5 @@ Union.lua
 Stats.lua
 Presence.lua
 UI.lua
+Map.lua
 Bindings.xml

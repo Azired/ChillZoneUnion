@@ -2,7 +2,7 @@
 local time, clients, wire, sent, protectedCalls = 100, {}, {}, 0, 0
 local deliveryFilter
 local guilds = { "Чиллзон", "Чиллзон Навсегда" }
-local modules = { "Libs/LibStub.lua", "Libs/LibDeflate.lua", "Core.lua", "Chat.lua", "Protocol.lua", "Roster.lua", "Network.lua", "Transfers.lua", "Union.lua", "Stats.lua", "Presence.lua", "UI.lua" }
+local modules = { "Libs/LibStub.lua", "Libs/LibDeflate.lua", "Core.lua", "Chat.lua", "Protocol.lua", "Roster.lua", "Network.lua", "Transfers.lua", "Union.lua", "Stats.lua", "Presence.lua", "Map.lua", "UI.lua" }
 local function expect(value, message) assert(value, message) end
 local function eq(a, b, message) assert(a == b, (message or "mismatch") .. ": " .. tostring(a) .. " ~= " .. tostring(b)) end
 local function UIObject()
@@ -16,6 +16,9 @@ local function UIObject()
         self.scripts[k] = function(self, ...) if previous then previous(self, ...) end; f(self, ...) end
     end
     function methods:RegisterEvent(e) self.events = self.events or {}; self.events[e] = true end
+    function methods:SetID(id) self.id = id end
+    function methods:GetID() return self.id end
+    function methods:GetParent() return self.parent end
     function methods:RegisterForClicks(...) self.clickButtons = { ... } end
     function methods:CreateFontString()
         local label = UIObject(); label.parent = self
@@ -74,6 +77,10 @@ local function UIObject()
     function methods:GetFrameLevel() return 1 end
     function methods:AddMessage(s) self.messages = self.messages or {}; self.messages[#self.messages + 1] = s end
     function methods:AddLine(...) self.lines = self.lines or {}; self.lines[#self.lines + 1] = { ... } end
+    function methods:AddDoubleLine(...) self.lines = self.lines or {}; self.lines[#self.lines + 1] = { ... } end
+    function methods:ClearLines() self.lines = {} end
+    function methods:SetOwner(owner) self.owner = owner end
+    function methods:IsOwned(owner) return self.owner == owner end
     function methods:Clear() self.messages = {} end
     function methods:GetScrollOffset() return self.scrollOffset or 0 end
     function methods:SetScrollOffset(v) self.scrollOffset = v end
@@ -286,6 +293,23 @@ local function Step(seconds, duplicate)
     end
 end
 local function Count(t) local n = 0; for _ in pairs(t) do n = n + 1 end; return n end
+local function FrameVisible(frame)
+    while frame do
+        if not frame:IsShown() then return false end
+        frame = frame.parent
+    end
+    return true
+end
+-- Exercise periodic UI/map drivers independently of transport timers so a
+-- handcrafted statistics roster remains authoritative during UI assertions.
+local function RunUIUpdates(client, elapsed)
+    time = time + elapsed
+    for _, frame in ipairs(client.allFrames) do
+        if frame ~= client.U.frame and FrameVisible(frame) and frame.scripts.OnUpdate then
+            frame.scripts.OnUpdate(frame, elapsed)
+        end
+    end
+end
 local a = NewClient("Ази Фелл", 1, 0)
 local a2 = NewClient("Борис Тихий", 1, 2)
 local b = NewClient("Антон Другой", 2, 0)
@@ -1439,6 +1463,546 @@ end
 local function UnknownLevelRow(stats)
     for _, row in ipairs(stats.rows) do if row.unknown then return row end end
 end
+local function ZoneRow(stats, name)
+    local key = name or ""
+    for _, row in ipairs(stats.zones) do
+        if key == "" and row.unknown or row.key == key then return row end
+    end
+end
+local function OverviewFixture()
+    local c, freshness = StatsFixture()
+    local function Member(name, guild, level, online, zone, rank)
+        return { name = name, guild = guild, class = "MAGE", level = level,
+            online = online, zone = zone, rank = rank or 2, rankName = "Member" }
+    end
+    c.U.own = {
+        [c.name] = Member(c.name, 1, 20, true, " Elwynn ", 0),
+        ["Own Second"] = Member("Own Second", 1, 40, true, "ELWYNN"),
+        ["own second"] = Member("own second", 1, 40, true, "ELWYNN"),
+        ["Own Offline"] = Member("Own Offline", 1, 60, false, "Offline Land"),
+        ["Own Unknown"] = Member("Own Unknown", 1, nil, true, "  "),
+        broken = false,
+    }
+    c.U.db.rosters[1] = { rows = c.U.own, at = c.U.stamp() }
+    c.U.db.rosters[2] = { at = c.U.stamp(), rows = {
+        ["Remote Leader"] = Member("Remote Leader", 2, 100, false, "Offline Land", 0),
+        ["Remote Same"] = Member("Remote Same", 2, 0, true, "elwynn"),
+        ["Remote Similar"] = Member("Remote Similar", 2, "50", true, "Elwynn Forest"),
+        ["Remote Unknown"] = Member("Remote Unknown", 2, 50, true, nil),
+        ["Remote Other"] = Member("Remote Other", 2, 30, true, "Durotar"),
+        broken = "not a member",
+    } }
+    c.U.AddonInfo = function(name, guild)
+        if guild == 1 and c.U.Fold(name) == c.U.Fold(c.name) then return { known = true, live = true } end
+        if name == "Remote Same" then return { known = true, live = true } end
+        if name == "Remote Similar" then return { known = true, live = false } end
+        return { known = false, live = false }
+    end
+    return c, freshness
+end
+
+do
+    local c, freshness = OverviewFixture()
+    local stats = c.U.OverviewStatistics()
+    eq(stats.rows, stats.zones, "overview location rows must share the public row collection")
+    eq(stats.total, 9, "overview dropped unknown levels or counted member aliases twice")
+    eq(stats.online, 7, "overview online total includes offline members")
+    expect(stats.complete and stats.onlineComplete, "fresh complete overview marked unknown")
+    eq(stats.guilds[1].total, 4, "own overview population counts case aliases twice")
+    eq(stats.guilds[1].online, 3, "own overview online count incorrect")
+    eq(stats.guilds[1].levelCount, 3, "unknown levels entered average denominator")
+    eq(stats.guilds[1].avgLevel, 40, "overview average must include valid offline levels")
+    eq(stats.guilds[1].maxLevel, 60, "overview maximum omitted valid offline member")
+    eq(stats.guilds[1].leader, c.name, "overview leader did not use native rank zero")
+    eq(stats.guilds[2].leader, "Remote Leader", "offline remote leader disappeared")
+    eq(stats.guilds[2].levelCount, 3, "zero or numeric-string level entered remote average")
+    eq(stats.guilds[2].avgLevel, 60, "remote average incorrect")
+    eq(stats.guilds[2].maxLevel, 100, "accepted maximum level omitted")
+    eq(stats.guilds[1].addonCount, 1, "unconfirmed addon presence counted as live")
+    eq(stats.guilds[1].addonUnknownOnline, 2, "unknown addon presence became proof of absence")
+    expect(not stats.guilds[1].addonComplete, "lower-bound addon count presented as complete")
+    eq(stats.guilds[2].addonCount, 1, "historical addon metadata counted as live")
+    eq(stats.guilds[2].addonUnknownOnline, 3, "remote addon unknown count incorrect")
+    eq(#stats.zones, 4, "offline cached location was shown or normalized zones split")
+    local elwynn, unknown = ZoneRow(stats, "elwynn"), ZoneRow(stats)
+    expect(elwynn and unknown, "normalized zone or unknown location bucket missing")
+    eq(elwynn.knownOnline, 3, "trimmed case-insensitive locations did not merge")
+    eq(elwynn.online, 3, "fresh zone count incorrect")
+    eq(elwynn.guilds[1].online, 2, "own zone count incorrect")
+    eq(elwynn.guilds[2].online, 1, "remote zone count incorrect")
+    eq(unknown.online, 2, "nil and blank locations were not grouped together")
+    eq(stats.zones[1].key, "elwynn", "overview locations not sorted by descending presence")
+    eq(stats.zones[2].key, "", "unknown bucket sorted inconsistently at its population")
+    eq(stats.zones[3].key, "durotar", "equal-population locations need stable normalized ordering")
+    local sum = 0
+    for _, row in ipairs(stats.zones) do
+        sum = sum + row.online
+        eq(row.guilds[1].online + row.guilds[2].online, row.online, "zone guild subtotals do not reconcile")
+    end
+    eq(sum, stats.online, "zone buckets do not cover every fresh online character")
+    expect(not ZoneRow(stats, "offline land"), "offline last-known zone shown as current")
+
+    freshness[2] = false
+    stats = c.U.OverviewStatistics()
+    eq(stats.total, 9, "stale overview erased known membership")
+    expect(stats.online == nil and not stats.onlineComplete, "stale overview reports precise union presence")
+    eq(stats.knownOnline, 3, "stale guild flags entered overview known online subtotal")
+    eq(#stats.zones, 2, "stale-only locations remained on overview")
+    eq(ZoneRow(stats, "elwynn").knownOnline, 2, "stale guild flags entered live zone count")
+    expect(ZoneRow(stats, "elwynn").online == nil and ZoneRow(stats, "elwynn").guilds[2].online == nil,
+        "stale zone guild presence became zero or a precise union total")
+    eq(stats.guilds[2].avgLevel, 60, "staleness erased known level summary")
+    expect(stats.guilds[2].addonCount == nil and stats.guilds[2].addonUnknownOnline == nil,
+        "stale addon summary must be unknown")
+    c.U.db.rosters[2] = nil
+    stats = c.U.OverviewStatistics()
+    expect(not stats.complete and stats.total == nil, "missing guild reported complete overview total")
+    eq(stats.knownTotal, 4, "missing guild erased own known population")
+    expect(stats.guilds[2].avgLevel == nil and stats.guilds[2].leader == nil, "missing guild invented overview metadata")
+    freshness[2] = true; c.U.db.rosters[2] = { rows = {}, at = c.U.stamp() }
+    stats = c.U.OverviewStatistics()
+    eq(stats.total, 4, "known empty guild changed own overview total")
+    eq(stats.online, 3, "known empty guild made own presence unknown")
+    eq(stats.guilds[2].addonCount, 0, "known empty guild addon summary is not zero")
+    expect(stats.guilds[2].addonComplete, "known empty guild addon summary marked partial")
+    c.U.own[c.name] = nil
+    stats = c.U.OverviewStatistics()
+    expect(stats.total == nil and not stats.guilds[1].known, "incomplete own overview roster became authoritative")
+    eq(#stats.zones, 0, "incomplete own roster leaked partial locations")
+end
+do
+    local c = OverviewFixture()
+    c.U.own["Own Unknown"].zone = {}
+    c.U.AddonInfo = nil
+    local stats = c.U.OverviewStatistics()
+    eq(ZoneRow(stats).online, 2, "nonstring zone must remain in the unknown location bucket")
+    expect(stats.guilds[1].addonCount == nil and not stats.guilds[1].addonComplete,
+        "absent addon-presence provider presented an authoritative zero")
+    c.U.AddonInfo = function() return { known = true, live = true } end
+    stats = c.U.OverviewStatistics()
+    expect(stats.guilds[1].addonComplete and stats.guilds[2].addonComplete,
+        "all live confirmed addon users still marked partial")
+    eq(stats.guilds[1].addonCount + stats.guilds[2].addonCount, stats.online,
+        "complete addon summaries do not match online population")
+    c.U.own[c.name].rank = 1
+    expect(c.U.OverviewStatistics().guilds[1].leader == nil, "overview invented a leader without rank zero")
+end
+print("PASS overview populations, normalized live locations, level summaries, leaders, addon lower bounds and stale/missing semantics")
+
+local function MapFixture()
+    local c, freshness = OverviewFixture()
+    local E, calls = c.E, { added = 0, removed = 0, registered = {} }
+    local infos, children = {}, {}
+    local function Location(id, name, mapType)
+        local info = { mapID = id, name = name, mapType = mapType or 3 }
+        infos[id] = info; children[#children + 1] = info
+    end
+    Location(1429, "Элвиннский лес")
+    Location(1411, "Дуротар")
+    Location(2001, "Elwynn")
+    Location(2002, "Elwynn Forest")
+    Location(2003, "Durotar")
+    Location(3001, "Same Name")
+    Location(3002, "Same Name")
+    Location(3003, "Elwynn", 5)
+    for i = 1, 140 do Location(4000 + i, "Bulk Zone " .. i) end
+    E.C_Map = {
+        GetMapInfo = function(id) return infos[id] end,
+        GetMapChildrenInfo = function(id) return id == 947 and children or {} end,
+    }
+    E.WorldMapFrame = UIObject(); E.WorldMapFrame.parent = E.UIParent
+    E.WorldMapFrame:Hide()
+    E.WorldMapFrame.SetMapID = function(self, id) self.mapID = id end
+    E.WorldMapFrame.GetMapID = function(self) return self.mapID or 947 end
+    E.LibStub:NewLibrary("HereBeDragons-2.0", 999)
+    local pins = E.LibStub:NewLibrary("HereBeDragons-Pins-2.0", 999)
+    function pins:AddWorldMapIconMap(ref, pin, id, x, y, flag)
+        expect(type(ref) == "table" and pin.frameType == "Button", "map library requires a reference and button pin")
+        expect(infos[id], "map marker registered for an unknown map")
+        eq(x, 0.5, "roster map marker must use zone centre rather than player coordinates")
+        eq(y, 0.5, "roster map marker must use zone centre rather than player coordinates")
+        eq(flag, 3, "zone markers must also project onto continent and world maps")
+        calls.added = calls.added + 1
+        calls.registered[pin] = { ref = ref, mapID = id, x = x, y = y }
+        pin.parent = E.WorldMapFrame; pin:Show()
+        return true
+    end
+    function pins:RemoveAllWorldMapIcons(ref)
+        calls.removed = calls.removed + 1
+        for pin, data in pairs(calls.registered) do if data.ref == ref then calls.registered[pin] = nil end end
+    end
+    return c, freshness, calls
+end
+
+do
+    local function CheckPinsBootstrap(mode)
+        local calls, reached = 0, 0
+        local env = { type = type, pcall = pcall, assert = assert,
+            MapCanvasDataProviderMixin = {}, MapCanvasPinMixin = {}, Minimap = {},
+            CreateFromMixins = function() end, CreateFramePool = function() end, GetCVar = function() end }
+        env._G = env
+        if mode ~= "missing-api" then env.C_Map = { GetMapInfo = function() end } end
+        local function InstallMap()
+            env.WorldMapFrame = { GetCanvas = function() end, AddDataProvider = function() end, pinPools = {} }
+        end
+        local function LoadMap(name)
+            eq(name, "Blizzard_WorldMap", "map library tried to load an unrelated addon")
+            calls = calls + 1
+            if mode == "failed-loader" then error("native map is unavailable") end
+            InstallMap()
+        end
+        if mode == "legacy" then env.LoadAddOn = LoadMap else env.C_AddOns = { LoadAddOn = LoadMap } end
+        if mode == "existing" then InstallMap() end
+        env.LibStub = setmetatable({ NewLibrary = function(_, major)
+            eq(major, "HereBeDragons-Pins-2.0", "world map bootstrap initialized an unrelated library")
+            reached = reached + 1
+            -- A newer installed version may decline this copy after capability
+            -- checks; stop here to isolate the real library's loading boundary.
+            return nil
+        end }, { __call = function(_, name, silent)
+            eq(name, "HereBeDragons-2.0", "map pin bootstrap did not check its coordinate library")
+            expect(silent, "optional map bootstrap must use a silent dependency lookup")
+            return {}
+        end })
+        local chunk = assert(loadfile("ChillZoneUnion/Libs/HereBeDragons-Pins-2.0.lua"))
+        setfenv(chunk, env); chunk()
+        return calls, reached
+    end
+    for _, mode in ipairs({ "modern", "legacy" }) do
+        local calls, reached = CheckPinsBootstrap(mode)
+        eq(calls, 1, "deferred native world map was not loaded exactly once via " .. mode .. " API")
+        eq(reached, 1, "map pin library did not initialize after deferred native map loading")
+    end
+    local calls, reached = CheckPinsBootstrap("existing")
+    eq(calls, 0, "already-loaded native map was loaded again")
+    eq(reached, 1, "already-loaded native map did not initialize pins")
+    calls, reached = CheckPinsBootstrap("missing-api")
+    eq(calls, 0, "missing map API still tried to load the native map addon")
+    eq(reached, 0, "missing native map capabilities initialized pins")
+    calls, reached = CheckPinsBootstrap("failed-loader")
+    eq(calls, 1, "failing native map loader did not run")
+    eq(reached, 0, "failing native map loader initialized pins without a canvas")
+end
+print("PASS bundled map pin library deferred native loading, both loader APIs and safe capability fallbacks")
+
+do
+    local c = OverviewFixture()
+    expect(not c.U.OpenUnionMap(), "map without the native world map API did not fail safely")
+    local status = c.U.UnionMapStatus()
+    expect(not status.available and type(status.reason) == "string" and status.reason ~= "",
+        "unavailable map has no useful status")
+    expect(not c.U.RefreshUnionMap(), "map without native APIs attempted to create pins")
+end
+do
+    local c, freshness, calls = MapFixture()
+    local U, E = c.U, c.E
+    eq(U.MapIDForZone("  ЭЛВИННСКИЙ ЛЕС  "), 1429, "localized map lookup must trim and fold case")
+    eq(U.MapIDForZone("ДУРОТАР"), 1411, "second localized map name was not indexed")
+    eq(U.MapIDForZone("elwynn"), 2001, "floor map overrode its named zone")
+    expect(not U.MapIDForZone("Same Name"), "ambiguous same-name maps must not receive guessed locations")
+    expect(not U.MapIDForZone("Missing Zone"), "unmapped location received a guessed map")
+    U.db.rosters[2].rows["Unmapped Remote"] = { name = "Unmapped Remote", guild = 2,
+        level = 20, rank = 2, online = true, zone = "Unmapped Zone", class = "MAGE" }
+    expect(U.OpenUnionMap("Элвиннский лес"), "available native map did not open")
+    expect(E.WorldMapFrame:IsShown(), "map action did not show the world map")
+    eq(E.WorldMapFrame:GetMapID(), 1429, "localized map action opened a different zone")
+    local status = U.UnionMapStatus()
+    expect(status.available and status.enabled and status.onlineComplete, "available fresh map status incorrect")
+    eq(status.mappedZones, 3, "mapped locations omitted or combined distinct zone names")
+    eq(status.unmappedZones, 1, "unmapped location was silently lost")
+    eq(status.unknownOnline, 2, "unknown-location players were silently lost")
+    eq(status.visiblePins, 3, "one aggregated marker per mapped zone is required")
+    eq(Count(calls.registered), 3, "map provider registration count differs from visible status")
+    local function Pin(key)
+        for _, pin in ipairs(U.UnionMap.active) do if pin.zoneRow.key == key then return pin end end
+    end
+    local elwynn = Pin("elwynn")
+    expect(elwynn and elwynn.zoneRow.guilds[1].online == 2 and elwynn.zoneRow.guilds[2].online == 1,
+        "aggregated map marker lost its guild breakdown")
+    eq(elwynn.count:GetText(), "3", "map marker does not show its aggregate population")
+    eq(calls.registered[elwynn].mapID, 2001, "map marker used substring location lookup")
+    local added, removed, frameCount = calls.added, calls.removed, #c.allFrames
+    expect(not U.RefreshUnionMap(), "map refresh ignored its throttle")
+    RunUIUpdates(c, 2.1)
+    eq(calls.added, added, "unchanged periodic map snapshot recreated markers")
+    eq(calls.removed, removed, "unchanged periodic map snapshot removed markers")
+    eq(#c.allFrames, frameCount, "unchanged map refresh allocated new frames")
+    elwynn.scripts.OnEnter(elwynn)
+    local tooltipLines = #(E.GameTooltip.lines or {})
+    elwynn.scripts.OnEnter(elwynn)
+    eq(#E.GameTooltip.lines, tooltipLines, "repeated map tooltips accumulated old lines")
+    elwynn:Hide()
+    expect(not E.GameTooltip:IsShown() and not elwynn.hovered, "provider-hidden map pin left its tooltip active")
+    RunUIUpdates(c, 2.1)
+    expect(not E.GameTooltip:IsShown(), "unchanged map refresh reopened an off-map pin tooltip")
+    elwynn:Show(); elwynn.scripts.OnEnter(elwynn)
+
+    freshness[2] = false; U.MarkMapDirty(); RunUIUpdates(c, 2.1)
+    status, elwynn = U.UnionMapStatus(), Pin("elwynn")
+    expect(not status.onlineComplete and elwynn and not elwynn.onlineComplete,
+        "stale map snapshot claimed complete online counts")
+    eq(status.visiblePins, 1, "stale remote-only zones remained on the map")
+    eq(status.unknownOnline, 1, "stale remote unknown locations entered the map count")
+    eq(elwynn.count:GetText(), "2", "stale guild presence entered known map population")
+    expect(E.GameTooltip:IsShown() and elwynn.hovered, "visible hovered zone lost its tooltip when counts changed")
+    E.GameTooltip:SetText(""); elwynn.scripts.OnEnter(elwynn)
+    local firstGuild, secondGuild
+    for _, line in ipairs(E.GameTooltip.lines or {}) do
+        if line[1] == U.GUILDS[1] then firstGuild = line[2] end
+        if line[1] == U.GUILDS[2] then secondGuild = line[2] end
+    end
+    eq(firstGuild, "2", "map tooltip omitted the fresh guild population")
+    expect(type(secondGuild) == "string" and secondGuild ~= "0" and tonumber(secondGuild) == nil,
+        "map tooltip represented stale guild presence as zero")
+    local clicked
+    U.OpenLocationRoster = function(name) clicked = name end
+    elwynn.scripts.OnClick(elwynn, "LeftButton")
+    eq(U.Fold(U.Trim(clicked)), "elwynn", "map marker did not route its exact zone to the roster")
+    expect(not E.WorldMapFrame:IsShown(), "map marker did not dismiss the world map before roster navigation")
+    expect(not E.GameTooltip:IsShown(), "map hide left a marker tooltip open")
+    added = calls.added; RunUIUpdates(c, 4)
+    eq(calls.added, added, "hidden world map still updated its pin provider")
+    expect(U.SetUnionMapPins(false) and not U.UnionMapPinsEnabled(), "map visibility setting did not persist")
+    eq(#U.UnionMap.active, 0, "disabling map markers left active pins")
+    eq(Count(calls.registered), 0, "disabling map markers left provider registrations")
+    expect(U.SetUnionMapPins(true) and U.UnionMapPinsEnabled(), "map visibility setting could not be restored")
+    expect(U.OpenUnionMap(), "map could not reopen after pin visibility changed")
+    RunUIUpdates(c, 2.1)
+    eq(U.UnionMapStatus().visiblePins, 1, "reopening the map did not restore enabled markers")
+
+    local rows = {}
+    for i = 1, 140 do
+        rows[i] = { name = "Bulk Zone " .. i, key = "bulk zone " .. i, knownOnline = i,
+            guilds = { [1] = { online = i }, [2] = { online = 0 } } }
+    end
+    U.OverviewStatistics = function() return { zones = rows, onlineComplete = true } end
+    U.MarkMapDirty(); RunUIUpdates(c, 2.1)
+    status = U.UnionMapStatus()
+    eq(status.mappedZones, 140, "large map did not report all mapped locations")
+    eq(status.visiblePins, 128, "large map marker cap changed")
+    eq(status.limited, 12, "large map did not report locations beyond its marker cap")
+    eq(#U.UnionMap.active + #U.UnionMap.pool, 128, "large map allocated more than its bounded pin pool")
+    local lowest = 140
+    for _, pin in ipairs(U.UnionMap.active) do lowest = math.min(lowest, pin.zoneRow.knownOnline) end
+    eq(lowest, 13, "pin cap discarded populated zones before quieter zones")
+    frameCount = #c.allFrames
+    rows = { rows[1] }; U.MarkMapDirty(); RunUIUpdates(c, 2.1)
+    eq(#U.UnionMap.active, 1, "shrinking map did not release obsolete markers")
+    eq(#U.UnionMap.active + #U.UnionMap.pool, 128, "shrinking map lost its reusable pool")
+    rows = {}; U.MarkMapDirty(); RunUIUpdates(c, 2.1)
+    eq(#U.UnionMap.active, 0, "empty live map left stale markers")
+    eq(Count(calls.registered), 0, "empty live map left provider registrations")
+    eq(#c.allFrames, frameCount, "map population changes allocated beyond the existing pool")
+end
+print("PASS native world map fallback, localized/ambiguous lookup, aggregate centre pins, partial counts, navigation, refresh and bounded reuse")
+
+local function RosterControls(c)
+    local search, offline, filter, clear
+    for _, frame in ipairs(c.allFrames) do
+        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
+        if frame.frameType == "Button" and frame.width == 180 and frame.parent and frame.parent.move then filter = frame end
+        if frame.czuLocationClear then clear = frame end
+    end
+    expect(search and offline and filter and clear, "location navigation needs complete roster filter controls")
+    return search, offline, filter, clear
+end
+local function VisibleRoster(c)
+    local found = {}
+    for _, frame in ipairs(c.allFrames) do
+        if frame.row and FrameVisible(frame) then found[#found + 1] = frame.row end
+    end
+    return found
+end
+local function OverviewControls(c)
+    local controls = {}
+    for _, frame in ipairs(c.allFrames) do
+        if frame.czuOverviewAction then controls[frame.czuOverviewAction] = frame end
+    end
+    for _, action in ipairs({ "scope", "map", "pins", "classes", "levels", "refresh", "previous", "next" }) do
+        expect(controls[action] and controls[action].scripts.OnClick, "overview action missing: " .. action)
+    end
+    return controls
+end
+local function VisibleLocations(c)
+    local found = {}
+    for _, frame in ipairs(c.allFrames) do
+        if frame.parent == c.E.ChillZoneUnionOverview and frame.zoneRow and FrameVisible(frame) then found[#found + 1] = frame end
+    end
+    return found
+end
+local function VisibleLocation(c, key)
+    for _, frame in ipairs(VisibleLocations(c)) do if frame.zoneRow.key == key then return frame end end
+end
+do
+    local c, freshness = OverviewFixture()
+    -- Native rosters have one row per member. Alias corruption is covered in
+    -- model tests independently of the existing roster renderer.
+    c.U.own["own second"], c.U.own.broken, c.U.db.rosters[2].rows.broken = nil, nil, nil
+    c.U.own[c.name].rank, c.U.own["Own Offline"].rank = 2, 0
+    local U, E = c.U, c.E
+    U.OpenRoster()
+    local search, offline, guildFilter, clear = RosterControls(c)
+    search:SetText("Remote"); search.scripts.OnTextChanged(search, true)
+    offline:SetChecked(true); offline.scripts.OnClick(offline)
+    guildFilter.scripts.OnClick(guildFilter)
+    search:SetFocus(); U.OpenOverview()
+    local page, controls = E.ChillZoneUnionOverview, OverviewControls(c)
+    expect(page and FrameVisible(page), "ordinary member could not open the separate overview page")
+    local unavailable, mapStatusLabel = U.UnionMapStatus()
+    for _, label in ipairs(page.fontStrings or {}) do
+        if label:GetText():find(unavailable.reason, 1, true) then mapStatusLabel = label end
+    end
+    expect(not unavailable.available and mapStatusLabel, "overview did not explain unavailable native map markers")
+    local unavailableMapText = mapStatusLabel:GetText()
+    expect(not U.IsMaster() and not U.IsOfficer(), "overview fixture unexpectedly has officer privileges")
+    expect(not search:HasFocus(), "overview navigation left a hidden roster input focused")
+    eq(search:GetText(), "Remote", "overview navigation discarded the roster draft filter")
+    expect(not search.parent:IsShown(), "overview left the roster page shown")
+    local tabs = {}
+    for id = 1, 5 do
+        tabs[id] = E["ChillZoneUnionWindowTab" .. id]
+        expect(tabs[id] and tabs[id]:GetID() == id, "native bottom tab identity changed: " .. id)
+    end
+    expect(tabs[5].nativeTabSelected and tabs[5].czuSelected, "overview native tab was not selected")
+    eq(tabs[5].point[2], E.ChillZoneUnionWindow, "overview tab is not first in the bottom tab row")
+    eq(tabs[1].point[2], tabs[5], "existing roster tab does not follow the overview tab")
+    eq(tabs[2].point[2], tabs[1], "existing chat tab identity or order changed")
+    local cards = {}
+    for _, frame in ipairs(c.allFrames) do
+        if frame.parent == page and frame.guildSummary then cards[#cards + 1] = frame end
+    end
+    eq(#cards, 2, "overview must render one summary card per guild")
+    expect(cards[1].counts:GetText():find("3 / 4", 1, true), "own card counters depend on roster filters")
+    expect(cards[2].counts:GetText():find("4 / 5", 1, true), "remote card counters depend on roster filters")
+    expect(cards[1].levels:GetText():find("40.0", 1, true) and cards[1].levels:GetText():find("60", 1, true),
+        "guild card omitted average or maximum level")
+    expect(cards[1].levels:GetText():find("(по 3)", 1, true), "partial level summary did not disclose its valid-level sample")
+    expect(cards[1].leader:GetText():find("Own Offline", 1, true), "guild card omitted the native leader")
+    expect(cards[2].leader:GetText():find("Remote Leader", 1, true), "guild card omitted the offline remote leader")
+    expect(cards[1].addons:GetText():find("1", 1, true) and cards[1].addons:GetText():find("2", 1, true),
+        "guild card omitted confirmed and unknown addon populations")
+    eq(#VisibleLocations(c), 4, "overview location counts depend on hidden roster filters")
+    local elwynn = VisibleLocation(c, "elwynn")
+    expect(elwynn and elwynn.bar.frameType == "StatusBar", "overview needs a real population bar")
+    eq(elwynn.bar.value, 3, "overview location bar shows a different count from its population")
+    eq(elwynn.bar.minValue, 0, "overview bar baseline must remain zero")
+    eq(elwynn.bar.maxValue, 3, "overview bar scale must use the largest displayed population")
+    eq(elwynn.count:GetText(), "3", "fresh overview location label is not precise")
+    elwynn.scripts.OnEnter(elwynn)
+    expect(E.GameTooltip:IsShown(), "overview row has no guild-breakdown tooltip")
+    U.OpenChat(); expect(not E.GameTooltip:IsShown(), "overview tab switch left its location tooltip open")
+    U.OpenOverview(); controls.classes.scripts.OnClick(controls.classes)
+    expect(tabs[1].nativeTabSelected and not page:IsShown(), "overview class action did not select roster statistics")
+    U.OpenOverview(); controls.levels.scripts.OnClick(controls.levels)
+    expect(E.ChillZoneUnionLevelStatistics:IsShown() and tabs[1].nativeTabSelected,
+        "overview level action did not open the level chart")
+    U.OpenOverview()
+    local openMap, opened = U.OpenUnionMap, 0
+    U.OpenUnionMap = function() opened = opened + 1; return false end
+    controls.map.scripts.OnClick(controls.map)
+    expect(E.ChillZoneUnionWindow:IsShown(), "unavailable map action hid the only useful window")
+    U.OpenUnionMap = function() opened = opened + 1; return true end
+    controls.map.scripts.OnClick(controls.map)
+    eq(opened, 2, "overview map action did not use the native map entry point")
+    expect(not E.ChillZoneUnionWindow:IsShown(), "successful map action left the union window covering it")
+    U.OpenUnionMap = openMap; U.OpenOverview()
+    controls.pins:SetChecked(false); controls.pins.scripts.OnClick(controls.pins)
+    expect(not U.UnionMapPinsEnabled(), "overview marker checkbox did not disable markers")
+    expect(mapStatusLabel:GetText() ~= unavailableMapText, "overview marker status did not explain the disabled setting")
+    controls.pins:SetChecked(true); controls.pins.scripts.OnClick(controls.pins)
+    expect(U.UnionMapPinsEnabled(), "overview marker checkbox did not enable markers")
+    eq(mapStatusLabel:GetText(), unavailableMapText, "restoring marker setting lost the unavailable-map explanation")
+    local requestRoster, requests = U.RequestRoster, 0
+    U.RequestRoster = function() requests = requests + 1 end; U.snapshotDue = 999
+    controls.refresh.scripts.OnClick(controls.refresh)
+    eq(requests, 1, "overview refresh did not request fresh membership")
+    eq(U.snapshotDue, 0, "overview refresh did not schedule union synchronization")
+    U.RequestRoster = requestRoster
+
+    elwynn = VisibleLocation(c, "elwynn"); elwynn.scripts.OnClick(elwynn)
+    expect(FrameVisible(search.parent) and not page:IsShown() and tabs[1].nativeTabSelected,
+        "location click did not switch to the native roster page")
+    expect(clear:IsShown() and search:GetText() == "" and not offline:GetChecked(),
+        "location click did not expose its exact-filter chip and clear conflicting inputs")
+    local roster = VisibleRoster(c)
+    eq(#roster, 3, "location click used substring search or retained a previous guild filter")
+    for _, member in ipairs(roster) do
+        eq(U.Fold(U.Trim(member.zone)), "elwynn", "exact location filter matched a longer location name")
+        expect(member.online == true, "exact location filter included an offline member")
+    end
+    search:SetText("Elwynn"); search.scripts.OnTextChanged(search, true)
+    expect(not clear:IsShown(), "manual roster search did not clear the exact location filter")
+    eq(#VisibleRoster(c), 4, "manual search remained constrained by a hidden exact location")
+    U.OpenOverview(); local unknown = VisibleLocation(c, "")
+    unknown.scripts.OnClick(unknown)
+    eq(#VisibleRoster(c), 2, "unknown location click did not match nil and blank online locations")
+    expect(clear:IsShown(), "unknown location click has no visible filter explanation")
+    clear.scripts.OnClick(clear)
+    expect(not clear:IsShown(), "clear location action left its filter chip shown")
+    eq(#VisibleRoster(c), 7, "clearing exact location did not restore the fresh online roster")
+
+    U.OpenOverview(); controls.scope.scripts.OnClick(controls.scope)
+    eq(controls.scope:GetText(), U.GUILDS[1], "overview scope did not select the first guild")
+    eq(#VisibleLocations(c), 2, "own-guild overview scope included remote-only zones")
+    elwynn = VisibleLocation(c, "elwynn"); eq(elwynn.count:GetText(), "2", "guild scope did not change location counts")
+    elwynn.scripts.OnClick(elwynn)
+    roster = VisibleRoster(c); eq(#roster, 2, "guild-scoped location did not preserve its roster scope")
+    for _, member in ipairs(roster) do eq(member.guild, 1, "own-guild location click included another guild") end
+    U.OpenOverview(); controls.scope.scripts.OnClick(controls.scope)
+    eq(controls.scope:GetText(), U.GUILDS[2], "overview scope did not select the second guild")
+    elwynn = VisibleLocation(c, "elwynn"); elwynn.scripts.OnClick(elwynn)
+    roster = VisibleRoster(c); eq(#roster, 1, "remote-guild location scope did not restrict the roster")
+    eq(roster[1].guild, 2, "remote-guild location click included own guild")
+    freshness[2] = false; U.Refresh()
+    eq(#VisibleRoster(c), 0, "stale remote presence survived an exact online location filter")
+    U.OpenOverview()
+    eq(#VisibleLocations(c), 0, "stale guild scope continued showing old zones")
+    expect(page.empty:IsShown() and page.empty:GetText() ~= "", "stale guild scope has no visible unknown-data state")
+    controls.scope.scripts.OnClick(controls.scope)
+    eq(#VisibleLocations(c), 2, "partial union overview lost fresh locations")
+    eq(VisibleLocation(c, "elwynn").count:GetText(), "2 + ?", "partial union location count was presented as complete")
+    expect(cards[2].counts:GetText():find("? / 5", 1, true), "stale guild card did not retain total with unknown presence")
+    c.U.own["Own Second"].online = false; RunUIUpdates(c, 2.1)
+    eq(VisibleLocation(c, "elwynn").count:GetText(), "1 + ?", "overview did not refresh changing presence while visible")
+    U.OpenLocationRoster("Elwynn", 0); offline:SetChecked(true); offline.scripts.OnClick(offline)
+    expect(not clear:IsShown(), "manual offline toggle left a hidden exact location filter")
+end
+do
+    local c = OverviewFixture()
+    c.U.own["own second"], c.U.own.broken, c.U.db.rosters[2].rows.broken = nil, nil, nil
+    for i = 1, 12 do
+        local name = "Paging Member " .. i
+        c.U.own[name] = { name = name, guild = 1, level = 20, rank = 2, online = true,
+            zone = "Paging Zone " .. i, class = "MAGE" }
+    end
+    c.U.OpenOverview()
+    local page, controls = c.E.ChillZoneUnionOverview, OverviewControls(c)
+    eq(#VisibleLocations(c), 8, "overview must limit each page to eight locations")
+    expect(page.range:GetText():find("1–8", 1, true), "overview first-page range incorrect")
+    expect(not controls.previous:IsEnabled() and controls.next:IsEnabled(), "overview initial paging controls incorrect")
+    local first = {}
+    for _, frame in ipairs(VisibleLocations(c)) do first[frame.zoneRow.key] = true end
+    controls.next.scripts.OnClick(controls.next)
+    eq(#VisibleLocations(c), 8, "overview next page lost locations")
+    expect(page.range:GetText():find("9–16", 1, true), "overview next-page range incorrect")
+    expect(controls.previous:IsEnabled() and not controls.next:IsEnabled(), "overview final-page controls incorrect")
+    for _, frame in ipairs(VisibleLocations(c)) do expect(not first[frame.zoneRow.key], "overview pages repeated a location") end
+    local row = VisibleLocations(c)[1]; row.scripts.OnMouseWheel(row, 1)
+    expect(page.range:GetText():find("6–13", 1, true), "location-row wheel did not scroll the overview")
+    page.scripts.OnMouseWheel(page, 100)
+    expect(page.range:GetText():find("1–8", 1, true), "overview wheel did not clamp its lower bound")
+    page.scripts.OnMouseWheel(page, -100)
+    expect(page.range:GetText():find("9–16", 1, true), "overview wheel did not clamp its upper bound")
+    for name, member in pairs(c.U.own) do member.online = name == c.name end
+    for _, member in pairs(c.U.db.rosters[2].rows) do if type(member) == "table" then member.online = false end end
+    c.U.Refresh()
+    eq(#VisibleLocations(c), 1, "overview did not hide obsolete rows after population changes")
+    expect(page.range:GetText():find("1–1", 1, true), "overview offset was not clamped after population shrank")
+    expect(not controls.previous:IsEnabled() and not controls.next:IsEnabled(), "one-location overview kept stale paging controls")
+end
+print("PASS ordinary-member overview cards, stable tabs, actions, exact location scope/clear, live unknown states and bounded pagination")
+
 local function LevelModelFixture()
     local c, freshness = StatsFixture()
     local function Member(name, guild, level, online)
@@ -1694,7 +2258,7 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
-        if frame.text == "Весь союз" and not frame.czuLevelAction then guildFilter = frame end
+        if frame.text == "Весь союз" and not frame.czuLevelAction and not frame.czuOverviewAction then guildFilter = frame end
         if frame.text == "Статистика" then openStats = frame end
         if frame.text == "К списку" and frame.czuLevelAction ~= "back" then back = frame end
     end
@@ -1747,7 +2311,7 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
-        if frame.text == "Весь союз" and not frame.czuLevelAction then guildFilter = frame end
+        if frame.text == "Весь союз" and not frame.czuLevelAction and not frame.czuOverviewAction then guildFilter = frame end
         if frame.text == "Статистика" then statistics = frame end
         if frame.text == "По уровням" then toLevels = frame end
         if frame.text == "К списку" and not frame.czuLevelAction then classBack = frame end
@@ -2308,7 +2872,7 @@ do
     local roster, search, guildFilter, offline, sortHeader, close = target.parent
     for _, frame in ipairs(owner.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
-        if frame.text == "Весь союз" and not frame.czuLevelAction then guildFilter = frame end
+        if frame.text == "Весь союз" and not frame.czuLevelAction and not frame.czuOverviewAction then guildFilter = frame end
         if frame.frameType == "CheckButton" and frame.parent == roster then offline = frame end
         if frame.sortTitle == "Имя" then sortHeader = frame end
         if frame.template == "UIPanelCloseButton" then close = frame end

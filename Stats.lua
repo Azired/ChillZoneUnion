@@ -69,10 +69,10 @@ local function EachMember(sourceRows, visit)
         for key, member in pairs(sourceRows[guild]) do
             if type(member) == "table" then
                 local name = U.Name(member.name) or U.Name(key) or tostring(key)
-                name = U.Fold(name)
-                if not seen[name] then
-                    seen[name] = true
-                    visit(member, guild)
+                local key = U.Fold(name)
+                if not seen[key] then
+                    seen[key] = true
+                    visit(member, guild, name)
                 end
             end
         end
@@ -125,8 +125,12 @@ function U.ClassStatistics()
     return FinishStatistics(result)
 end
 
+local function ValidLevel(level)
+    return type(level) == "number" and level == level and level >= 1 and level <= 100 and level % 1 == 0
+end
+
 local function LevelBounds(level, step)
-    if type(level) ~= "number" or level ~= level or level < 1 or level > 100 or level % 1 ~= 0 then return end
+    if not ValidLevel(level) then return end
     if level == 60 then return 60, 60 end
     local lower = math.max(1, math.floor(level / step) * step)
     if level > 60 then lower = math.max(61, lower) end
@@ -172,5 +176,78 @@ function U.LevelStatistics(step)
     table.sort(extra)
     for _, lower in ipairs(extra) do result.rows[#result.rows + 1] = byLower[lower] end
     if unknown then result.rows[#result.rows + 1] = unknown end
+    return FinishStatistics(result)
+end
+
+-- Overview totals use every known character. Locations use only fresh online
+-- observations: an offline character's last zone is not a current location.
+function U.OverviewStatistics()
+    local result, sourceRows = StatisticsSources()
+    local summary = StatisticsRow({}, result.guilds)
+    local byZone = {}
+    result.zones = result.rows
+    for guild = 1, 2 do
+        local metadata = result.guilds[guild]
+        metadata.levelCount, metadata.levelSum = 0, 0
+        metadata.addonCount = metadata.fresh and type(U.AddonInfo) == "function" and 0 or nil
+        metadata.addonUnknownOnline = metadata.fresh and 0 or nil
+        metadata.addonComplete = metadata.fresh and type(U.AddonInfo) == "function"
+    end
+    local function ZoneRow(name, key, unknown)
+        local row = { name = name, label = name, key = key, unknown = unknown,
+            knownOnline = 0, guilds = {} }
+        for guild = 1, 2 do
+            row.guilds[guild] = { online = result.guilds[guild].fresh and 0 or nil }
+        end
+        byZone[key] = row
+        result.zones[#result.zones + 1] = row
+        return row
+    end
+    EachMember(sourceRows, function(member, guild, name)
+        CountMember(result, summary, member, guild)
+        local metadata = result.guilds[guild]
+        if ValidLevel(member.level) then
+            metadata.levelSum = metadata.levelSum + member.level
+            metadata.levelCount = metadata.levelCount + 1
+            metadata.maxLevel = math.max(metadata.maxLevel or member.level, member.level)
+        end
+        if member.rank == 0 and (not metadata.leader or U.Fold(name) < U.Fold(metadata.leader)
+            or U.Fold(name) == U.Fold(metadata.leader) and name < metadata.leader) then
+            metadata.leader = name
+        end
+        if not metadata.fresh or member.online ~= true then return end
+
+        local presence = type(U.AddonInfo) == "function" and U.AddonInfo(name, guild)
+        if type(presence) == "table" and presence.known == true and presence.live == true then
+            metadata.addonCount = metadata.addonCount + 1
+        else
+            metadata.addonUnknownOnline = metadata.addonUnknownOnline + 1
+            metadata.addonComplete = false
+        end
+
+        local zone = type(member.zone) == "string" and U.Trim(member.zone) or ""
+        local key, unknown = U.Fold(zone), zone == ""
+        if unknown then key = ""; zone = U.ClassInfo("UNKNOWN").label end
+        local row = byZone[key] or ZoneRow(zone, key, unknown)
+        -- Equivalent localized spellings choose the same display name even if
+        -- table iteration order changes between refreshes.
+        if not unknown and zone < row.name then row.name, row.label = zone, zone end
+        row.knownOnline = row.knownOnline + 1
+        row.guilds[guild].online = row.guilds[guild].online + 1
+    end)
+    for guild = 1, 2 do
+        local metadata = result.guilds[guild]
+        if metadata.levelCount > 0 then metadata.avgLevel = metadata.levelSum / metadata.levelCount end
+        metadata.levelComplete = metadata.known and metadata.levelCount == metadata.total
+        metadata.levelSum = nil
+        -- A live count is a lower bound. A missing response or historical
+        -- presence never proves that an online member lacks the addon.
+        metadata.addonKnownOnline = metadata.addonCount
+    end
+    table.sort(result.zones, function(a, b)
+        if a.knownOnline ~= b.knownOnline then return a.knownOnline > b.knownOnline end
+        if a.key ~= b.key then return a.key < b.key end
+        return a.name < b.name
+    end)
     return FinishStatistics(result)
 end

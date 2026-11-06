@@ -24,6 +24,15 @@ Bundled third-party libraries retain their own licenses:
 LibStub: public domain (original header in Libs/LibStub.lua).
 LibDeflate: zlib License; copyright 2018-2020 Haoqian He
 (full original notice in Libs/LibDeflate.lua).
+CallbackHandler-1.0: Ace3 license; copyright 2007 Ace3 Development Team
+(full license in Libs/LICENSE-Ace3.txt).
+HereBeDragons-2.0 and HereBeDragons-Pins-2.0: BSD license;
+author Hendrik Leppkes (Nevcairiel), bundled release 2.18-release
+(full upstream license and source notice in Libs/LICENSE-HereBeDragons.txt).
+
+The bundled HereBeDragons libraries contain ChillZoneUnion capability guards
+for clients without the required map APIs. The source changes are marked;
+the original library headers and license notices are retained.
 
 The bundled LibDeflate copy contains ChillZoneUnion modifications (2026):
 private addon instance and bounded decompression. Modified source is marked;

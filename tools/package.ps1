@@ -12,6 +12,7 @@ $manifest = @(
     'ChillZoneUnion.toc',
     'Core.lua',
     'LICENSE.txt',
+    'Map.lua',
     'Network.lua',
     'Presence.lua',
     'Protocol.lua',
@@ -22,6 +23,11 @@ $manifest = @(
     'Transfers.lua',
     'UI.lua',
     'Union.lua',
+    'Libs/CallbackHandler-1.0.lua',
+    'Libs/HereBeDragons-2.0.lua',
+    'Libs/HereBeDragons-Pins-2.0.lua',
+    'Libs/LICENSE-Ace3.txt',
+    'Libs/LICENSE-HereBeDragons.txt',
     'Libs/LibDeflate.lua',
     'Libs/LibStub.lua',
     'Media/arrow-down.tga',
@@ -31,8 +37,8 @@ $manifest = @(
     'Media/minimap.tga',
     'Media/status-dot.tga'
 )
-if ($manifest.Count -ne 23 -or @($manifest | Select-Object -Unique).Count -ne 23) {
-    throw 'The addon package manifest must contain exactly 23 distinct files.'
+if ($manifest.Count -ne 29 -or @($manifest | Select-Object -Unique).Count -ne 29) {
+    throw 'The addon package manifest must contain exactly 29 distinct files.'
 }
 
 foreach ($relative in $manifest) {
@@ -74,7 +80,7 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
 }
 if ($ValidateOnly) {
-    Write-Output "Validated ChillZoneUnion ${version}: 23 addon files (developer tests excluded)."
+    Write-Output "Validated ChillZoneUnion ${version}: 29 addon files (developer tests excluded)."
     return
 }
 
@@ -102,7 +108,7 @@ try {
 $check = [IO.Compression.ZipFile]::OpenRead($archive)
 $hasher = [Security.Cryptography.SHA256]::Create()
 try {
-    if ($check.Entries.Count -ne 23) { throw 'The finished ZIP does not contain exactly 23 files.' }
+    if ($check.Entries.Count -ne 29) { throw 'The finished ZIP does not contain exactly 29 files.' }
     foreach ($relative in $manifest) {
         $entry = $check.GetEntry("ChillZoneUnion/$relative")
         if ($null -eq $entry) { throw "The finished ZIP is missing: $relative" }
@@ -118,4 +124,4 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "archive=$archive" -Encoding utf8
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha256=$sha256" -Encoding utf8
 }
-[pscustomobject]@{ Version = $version; Tag = $tag; Archive = $archive; SHA256 = $sha256; FileCount = 23 }
+[pscustomobject]@{ Version = $version; Tag = $tag; Archive = $archive; SHA256 = $sha256; FileCount = 29 }
