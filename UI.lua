@@ -37,6 +37,7 @@ local function Edit(parent, x, y, width, hint)
     return b
 end
 local Native = {}
+local Level = { rows = {}, offset = 0, step = 10, scope = 0, mode = "total" }
 function Native.HasMethod(object, method)
     local kind = type(object)
     return (kind == "table" or kind == "userdata") and type(object[method]) == "function"
@@ -75,6 +76,7 @@ function Native.RowArt(button, index)
     if Native.HasMethod(highlight, "SetVertexColor") then highlight:SetVertexColor(0.3, 0.5, 1, 0.3) end
 end
 function Native.ClearPageFocus()
+    if Level.hover then Level.hover = nil; GameTooltip:Hide() end
     for _, edit in pairs({ search = search, chat = chatBox, contact = contact, announcement = announcementEdit }) do
         if edit:HasFocus() then edit:ClearFocus() end
     end
@@ -85,7 +87,7 @@ function Native.ResizeTab(tab)
     end
 end
 function Native.RefreshTabs()
-    local current = page == "stats" and "roster" or page
+    local current = (page == "stats" or page == "levels") and "roster" or page
     for key, tab in pairs(tabs) do
         local active = key == current
         tab.czuSelected = active
@@ -350,6 +352,16 @@ end
 RenderRoster = function()
     if not window then return end
     local all, summary, fresh = {}, {}, {}
+    local classes = {}
+    local function Class(row)
+        local token = type(row.class) == "string" and row.class or ""
+        if not classes[token] then
+            local info = U.ClassInfo(token)
+            info.sortName = U.Fold(info.label)
+            classes[token] = info
+        end
+        return classes[token]
+    end
     local onlineTotal, memberTotal, unknownOnline, unknownMembers, cached = 0, 0, false, false, false
     local needle = U.Fold(search:GetText() or "")
     for guild = 1, 2 do
@@ -360,7 +372,7 @@ RenderRoster = function()
         for _, row in pairs(GuildRows(guild)) do
             total = total + 1
             if fresh[guild] and row.online then online = online + 1 end
-            local text = U.Fold(row.name .. " " .. (row.rankName or "") .. " " .. (row.zone or ""))
+            local text = U.Fold(row.name .. " " .. Class(row).label .. " " .. (row.rankName or "") .. " " .. (row.zone or ""))
             if (guildFilter == 0 or guildFilter == guild) and (offline:GetChecked() or not fresh[guild] or row.online)
                 and (needle == "" or text:find(needle, 1, true)) then all[#all + 1] = row end
         end
@@ -385,7 +397,12 @@ RenderRoster = function()
     end
     table.sort(all, function(a, b)
         local an, bn = U.Fold(a.name), U.Fold(b.name)
-        if sortKey == "level" then
+        if sortKey == "class" then
+            local ac, bc = Class(a), Class(b)
+            local au, bu = ac.class == "UNKNOWN", bc.class == "UNKNOWN"
+            if au ~= bu then return not au end
+            if ac.sortName ~= bc.sortName then return Before(ac.sortName, bc.sortName) end
+        elseif sortKey == "level" then
             local av, bv = tonumber(a.level) or 0, tonumber(b.level) or 0
             if av ~= bv then return Before(av, bv) end
         elseif sortKey == "rank" then
@@ -423,6 +440,9 @@ RenderRoster = function()
             if addon.live then b.addonBadge:SetTextColor(0.45, 0.85, 0.78)
             else b.addonBadge:SetTextColor(0.45, 0.5, 0.53) end
             b.name:SetText(U.SafeDisplay(row.name)); b.name:SetTextColor(r * dim, g * dim, blue * dim)
+            local info = Class(row)
+            b.classText:SetText(U.SafeDisplay(info.label))
+            b.classText:SetTextColor(info.color.r * dim, info.color.g * dim, info.color.b * dim)
             b.guild:SetText(U.GUILDS[row.guild]); b.guild:SetTextColor(0.62, 0.69, 0.73)
             b.level:SetText(tostring(row.level))
             b.zone:SetText(fresh[row.guild] and U.SafeDisplay(row.online and row.zone or "Не в сети") or "Нет свежих данных")
@@ -511,7 +531,8 @@ end
 local function BuildClassStats(stats)
     Native.Inset(stats, -8, -79, 966, 349)
     Button(stats, "К списку", 0, 0, 130, function() Switch("roster") end)
-    Label(stats, "Статистика по классам", 155, -4, 620, "GameFontNormalLarge")
+    Label(stats, "Статистика по классам", 155, -4, 460, "GameFontNormalLarge")
+    Button(stats, "По уровням", 630, 0, 180, function() U.OpenLevelStats() end)
     Button(stats, "Обновить", 820, 0, 130, function() U.RequestRoster(); U.snapshotDue = 0; RenderClassStats() end)
     classSummary = Label(stats, "", 0, -41, 950, "GameFontHighlightSmall")
     classSummary:SetHeight(35); classSummary:SetJustifyV("TOP")
@@ -544,6 +565,142 @@ local function BuildClassStats(stats)
     local note = Label(stats, "? — данных пока нет. У сохранённого состава онлайн неизвестен.\nЕсли классы не помещаются, прокрутите колесом мыши.", 0, -435, 730, "GameFontHighlightSmall")
     note:SetHeight(34); note:SetJustifyV("TOP")
 
+end
+function Native.LevelRecord(record)
+    return Level.scope == 0 and record or record.guilds[Level.scope]
+end
+function Native.LevelValue(record)
+    local scoped = Native.LevelRecord(record)
+    local value = scoped[Level.mode]
+    local known = scoped[Level.mode == "online" and "knownOnline" or "knownTotal"]
+    return value, known or value or 0
+end
+function Native.LevelTooltip(frame)
+    local row = frame.levelRow
+    if not row then return end
+    Level.hover = frame
+    GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
+    GameTooltip:SetText(row.unknown and "Уровень неизвестен" or ("Уровни: " .. row.label), 1, 0.82, 0)
+    for guild = 1, 2 do
+        GameTooltip:AddLine(U.SafeDisplay(U.GUILDS[guild]) .. ": " .. ClassCountPair(row.guilds[guild]), 0.85, 0.87, 0.9)
+    end
+    GameTooltip:AddLine("Весь союз: " .. ClassCountPair(row), 1, 1, 1)
+    if Level.data then
+        local value, known = Native.LevelValue(row)
+        local total, totalKnown = Native.LevelValue(Level.data)
+        if total and total > 0 and value then
+            GameTooltip:AddLine(("Доля выбранной группы: %.1f%%"):format(value * 100 / total), 0.8, 0.8, 0.8)
+        elseif totalKnown > 0 then
+            GameTooltip:AddLine(("Доля среди известных: %.1f%%"):format(known * 100 / totalKnown), 0.8, 0.8, 0.8)
+        end
+    end
+    GameTooltip:AddLine("В сети / всего; считаем персонажей, включая офлайн.", 0.65, 0.68, 0.72)
+    GameTooltip:Show()
+end
+function Native.LevelScroll(_, delta)
+    Level.offset = Level.offset - delta * 3
+    Native.RenderLevelStats()
+end
+function Native.RenderLevelStats()
+    if not Level.page then return end
+    local data = U.LevelStatistics(Level.step)
+    Level.data = data
+    Level.offset = math.max(0, math.min(Level.offset, math.max(0, #data.rows - #Level.rows)))
+    local peak = 1
+    for _, row in ipairs(data.rows) do local _, known = Native.LevelValue(row); peak = math.max(peak, known) end
+    Level.scopeButton:SetText(Level.scope == 0 and "Весь союз" or U.GUILDS[Level.scope])
+    Level.modeButton:SetText(Level.mode == "online" and "В сети" or "Все персонажи")
+    Level.stepButton:SetText(Level.step == 1 and "Каждый уровень" or ("По " .. Level.step .. " уровней"))
+    local freshness = {}
+    for guild = 1, 2 do
+        if Level.scope == 0 or Level.scope == guild then
+            local state = data.guilds[guild]
+            freshness[#freshness + 1] = U.GUILDS[guild] .. ": " .. (not state.known and "нет данных"
+                or (state.fresh and "актуально" or ("сохранено " .. Age(state.at))))
+        end
+    end
+    Level.summary:SetText("В сети / всего: " .. ClassCountPair(Native.LevelRecord(data)) .. "     •     Фильтры состава не влияют.\n" .. table.concat(freshness, "     |     "))
+    Level.range:SetText((Level.offset + 1) .. "–" .. math.min(Level.offset + #Level.rows, #data.rows) .. " из " .. #data.rows)
+    Enable(Level.previous, Level.offset > 0)
+    Enable(Level.next, Level.offset + #Level.rows < #data.rows)
+    for index, frame in ipairs(Level.rows) do
+        local row = data.rows[Level.offset + index]
+        frame.levelRow = row; frame:SetShown(row ~= nil)
+        if row then
+            local value, known = Native.LevelValue(row)
+            frame.name:SetText(U.SafeDisplay(row.label))
+            frame.value:SetText(ClassCount(value, known))
+            frame.counts:SetText(ClassCountPair(Native.LevelRecord(row)))
+            frame.bar:SetMinMaxValues(0, peak); frame.bar:SetValue(known); frame.bar:SetShown(known > 0)
+            if Level.mode == "online" then frame.bar:SetStatusBarColor(0.25, 0.78, 0.35)
+            elseif Level.scope == 1 then frame.bar:SetStatusBarColor(0.25, 0.65, 0.85)
+            elseif Level.scope == 2 then frame.bar:SetStatusBarColor(0.65, 0.45, 0.85)
+            else frame.bar:SetStatusBarColor(0.85, 0.65, 0.22) end
+        end
+    end
+    if Level.hover then Native.LevelTooltip(Level.hover) end
+end
+function Native.BuildLevelStats(body)
+    local p = CreateFrame("Frame", "ChillZoneUnionLevelStatistics", window)
+    p:SetPoint("TOPLEFT", 24, -86); p:SetPoint("BOTTOMRIGHT", -24, 54)
+    p:SetFrameLevel(body:GetFrameLevel() + 2); p:Hide()
+    pages.levels, Level.page = p, p
+    Button(p, "К списку", 0, 0, 130, function() Switch("roster") end).czuLevelAction = "back"
+    Label(p, "Распределение по уровням", 155, -4, 460, "GameFontNormalLarge")
+    Button(p, "По классам", 630, 0, 180, function() U.OpenClassStats() end).czuLevelAction = "classes"
+    Button(p, "Обновить", 820, 0, 130, function() U.RequestRoster(); U.snapshotDue = 0; Native.RenderLevelStats() end).czuLevelAction = "refresh"
+    Level.scopeButton = Button(p, "Весь союз", 0, -40, 270, function()
+        Level.scope = (Level.scope + 1) % 3; Level.offset = 0; Native.RenderLevelStats()
+    end); Level.scopeButton.czuLevelAction = "scope"
+    Level.modeButton = Button(p, "Все персонажи", 285, -40, 150, function()
+        Level.mode = Level.mode == "total" and "online" or "total"; Native.RenderLevelStats()
+    end); Level.modeButton.czuLevelAction = "mode"
+    Level.stepButton = Button(p, "По 10 уровней", 450, -40, 180, function()
+        Level.step = Level.step == 10 and 5 or Level.step == 5 and 1 or 10
+        Level.offset = 0; Native.RenderLevelStats()
+    end); Level.stepButton.czuLevelAction = "step"
+    Level.summary = Label(p, "", 0, -76, 950, "GameFontHighlightSmall")
+    Level.summary:SetHeight(31); Level.summary:SetJustifyV("TOP")
+    p.summary = Level.summary
+    Native.Inset(p, -8, -106, 966, 328)
+    Label(p, "Уровни", 5, -112, 100, "GameFontNormal")
+    Label(p, "Количество персонажей", 120, -112, 550, "GameFontNormal")
+    Label(p, "В сети / всего", 755, -112, 190, "GameFontNormal")
+    for i = 1, 11 do
+        local frame = CreateFrame("Frame", nil, p)
+        frame:SetSize(950, 24); frame:SetPoint("TOPLEFT", 0, -136 - (i - 1) * 26); frame:EnableMouse(true)
+        local stripe = frame:CreateTexture(nil, "BACKGROUND"); stripe:SetAllPoints()
+        stripe:SetTexture("Interface\\GuildFrame\\GuildFrame")
+        stripe:SetTexCoord(0.36230469, 0.38183594, 0.95898438, 0.99804688)
+        stripe:SetAlpha(i % 2 == 0 and 0.16 or 0.04)
+        frame.name = Label(frame, "", 5, -6, 105, "GameFontHighlightSmall")
+        local track = frame:CreateTexture(nil, "BACKGROUND"); track:SetSize(550, 16); track:SetPoint("LEFT", 120, 0)
+        track:SetColorTexture(0, 0, 0, 0.4)
+        frame.bar = CreateFrame("StatusBar", nil, frame)
+        frame.bar:SetSize(550, 16); frame.bar:SetPoint("LEFT", 120, 0)
+        frame.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar"); frame.bar:EnableMouse(false)
+        frame.value = Label(frame, "", 680, -6, 70, "GameFontHighlightSmall")
+        frame.counts = Label(frame, "", 755, -6, 190, "GameFontHighlightSmall")
+        frame:SetScript("OnEnter", Native.LevelTooltip)
+        frame:EnableMouseWheel(true); frame:SetScript("OnMouseWheel", Native.LevelScroll)
+        local function Leave()
+            if Level.hover == frame then Level.hover = nil; GameTooltip:Hide() end
+        end
+        frame:SetScript("OnLeave", Leave); frame:SetScript("OnHide", Leave)
+        Level.rows[i] = frame
+    end
+    p:EnableMouseWheel(true)
+    p:SetScript("OnMouseWheel", Native.LevelScroll)
+    p:SetScript("OnHide", function() if Level.hover then Level.hover = nil; GameTooltip:Hide() end end)
+    Level.previous = Button(p, ArrowText("left"), 0, -447, 40, function()
+        Level.offset = Level.offset - #Level.rows; Native.RenderLevelStats()
+    end); Level.previous.czuLevelAction = "previous"
+    Level.range = Label(p, "", 55, -453, 150, "GameFontHighlightSmall"); p.range = Level.range
+    Level.next = Button(p, ArrowText("right"), 220, -447, 40, function()
+        Level.offset = Level.offset + #Level.rows; Native.RenderLevelStats()
+    end); Level.next.czuLevelAction = "next"
+    local note = Label(p, "? — данные неизвестны. Неполные полосы показывают известную часть.\nНаведите на строку для сводки по обеим гильдиям.", 280, -450, 670, "GameFontHighlightSmall")
+    note:SetHeight(34); note:SetJustifyV("TOP")
 end
 function U.BuildLinkApprovalControls(parent)
     local controls = {}
@@ -663,6 +820,7 @@ function U.Refresh()
     RenderAnnouncement()
     if page == "roster" then RenderRoster()
     elseif page == "stats" then RenderClassStats()
+    elseif page == "levels" then Native.RenderLevelStats()
     elseif page == "transfers" then RenderTickets()
     elseif page == "link" then RenderLinks() end
 end
@@ -744,7 +902,7 @@ Build = function()
     local r = pages.roster
     counts = Label(r, "", 0, 0, 950, "GameFontNormalLarge")
     guildCounts = Label(r, "", 0, -21, 950, "GameFontHighlightSmall")
-    search = Edit(r, 7, -60, 280, "Поиск по имени, званию или локации")
+    search = Edit(r, 7, -60, 280, "Имя, класс, звание или локация")
     search:SetScript("OnTextChanged", function() U.CloseRosterContextMenu(); offset = 0; RenderRoster() end)
     guildButton = Button(r, "Весь союз", 310, -61, 180, function()
         U.CloseRosterContextMenu()
@@ -752,10 +910,10 @@ Build = function()
         guildButton:SetText(guildFilter == 0 and "Весь союз" or U.GUILDS[guildFilter]); RenderRoster()
     end)
     offline = CreateFrame("CheckButton", nil, r, "UICheckButtonTemplate"); offline:SetSize(24, 24); offline:SetPoint("TOPLEFT", 510, -60)
-    Label(r, "Показывать офлайн", 538, -67, 175, "GameFontHighlightSmall")
+    Label(r, "Показывать офлайн", 538, -67, 160, "GameFontHighlightSmall")
     offline:SetScript("OnClick", function() U.CloseRosterContextMenu(); offset = 0; RenderRoster() end)
     Button(r, "Обновить", 820, -61, 130, function() U.RequestRoster(); U.snapshotDue = 0 end)
-    Button(r, "По классам", 715, -61, 95, function() U.OpenClassStats() end)
+    Button(r, "Статистика", 705, -61, 105, function() U.OpenClassStats() end)
     Native.Inset(r, -8, -94, 966, 320)
     local function SortHeader(key, title, x, width)
         local b = Native.Frame("Button", "ChillZoneUnionColumn" .. key, r,
@@ -780,17 +938,19 @@ Build = function()
         end)
         return b
     end
-    SortHeader("name", "Имя / класс", 4, 290)
-    SortHeader("level", "Ур.", 305, 50)
-    SortHeader("zone", "Локация", 365, 225)
+    SortHeader("name", "Имя", 4, 225)
+    SortHeader("class", "Класс", 235, 110)
+    SortHeader("level", "Ур.", 355, 45)
+    SortHeader("zone", "Локация", 410, 180)
     SortHeader("rank", "Звание", 600, 165)
     Label(r, "Гильдия", 775, -107, 170, "GameFontNormalSmall")
     for i = 1, 11 do
         local b = CreateFrame("Button", nil, r); b:SetSize(950, 24); b:SetPoint("TOPLEFT", 0, -128 - (i - 1) * 25)
         Native.RowArt(b, i)
         b.addonBadge = Label(b, "CZ", 5, -6, 20, "GameFontNormalSmall"); b.addonBadge:Hide()
-        b.name = Label(b, "", 29, -5, 266); b.level = Label(b, "", 320, -5, 35)
-        b.zone = Label(b, "", 365, -5, 225, "GameFontHighlightSmall"); b.rank = Label(b, "", 600, -5, 165, "GameFontHighlightSmall")
+        b.name = Label(b, "", 29, -5, 196); b.classText = Label(b, "", 235, -6, 110, "GameFontHighlightSmall")
+        b.level = Label(b, "", 365, -5, 35)
+        b.zone = Label(b, "", 410, -5, 180, "GameFontHighlightSmall"); b.rank = Label(b, "", 600, -5, 165, "GameFontHighlightSmall")
         b.guild = Label(b, "", 775, -5, 170, "GameFontHighlightSmall")
         b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         b:SetScript("OnClick", U.RosterRowClick)
@@ -810,6 +970,7 @@ Build = function()
     r.selection = Label(r, "", 0, -453, 950, "GameFontHighlightSmall")
 
     BuildClassStats(stats)
+    Native.BuildLevelStats(body)
 
     local c = pages.chat
     Native.Inset(c, -8, 8, 966, 44)
@@ -956,6 +1117,12 @@ function U.OpenClassStats()
     if not window then Build() end
     classOffset = 0
     window:Show(); Switch("stats")
+end
+function U.OpenLevelStats()
+    if not U.db then return end
+    if not window then Build() end
+    Level.offset = 0
+    window:Show(); Switch("levels")
 end
 
 local setupIntroPending = false

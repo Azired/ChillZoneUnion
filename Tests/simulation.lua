@@ -40,6 +40,16 @@ local function UIObject()
     function methods:SetTexture(path) self.texture = path end
     function methods:SetVertexColor(...) self.vertexColor = { ... } end
     function methods:SetColorTexture(...) self.colorTexture = { ... }; self.texture = nil end
+    function methods:SetStatusBarTexture(path) self.statusBarTexture = path end
+    function methods:SetStatusBarColor(...) self.statusBarColor = { ... } end
+    function methods:SetMinMaxValues(low, high)
+        assert(type(low) == "number" and type(high) == "number" and low <= high, "StatusBar requires valid numeric bounds")
+        self.minValue, self.maxValue = low, high
+    end
+    function methods:SetValue(value)
+        assert(type(value) == "number" and value == value, "StatusBar requires a numeric value")
+        self.value = value
+    end
     function methods:SetNormalTexture(asset)
         assert(asset ~= nil and asset ~= "", "SetNormalTexture requires a texture asset; use ClearNormalTexture to remove it")
         self.normalTexture = asset
@@ -1348,14 +1358,14 @@ do
         expect(header and type(header.scripts.OnClick) == "function", "sortable roster header missing: " .. title)
         header.scripts.OnClick(header)
     end
-    Click("Имя / класс"); Order({ A, B, G, D1, D2, O, E }, "name ascending is not alphabetical")
-    eq(headers["Имя / класс"]:GetText(), "Имя / класс", "sort header contains unsupported arrow characters")
-    expect(headers["Имя / класс"].sortArrow and headers["Имя / класс"].sortArrow:IsShown(), "active ascending sort arrow not shown")
-    expect(headers["Имя / класс"].sortArrow.texture:find("Media\\arrow-up", 1, true), "ascending direction does not use arrow texture")
-    Click("Имя / класс"); Order({ E, O, D1, D2, G, B, A }, "name descending or stable ties incorrect")
-    expect(headers["Имя / класс"].sortArrow.texture:find("Media\\arrow-down", 1, true), "descending direction does not use arrow texture")
+    Click("Имя"); Order({ A, B, G, D1, D2, O, E }, "name ascending is not alphabetical")
+    eq(headers["Имя"]:GetText(), "Имя", "sort header contains unsupported arrow characters")
+    expect(headers["Имя"].sortArrow and headers["Имя"].sortArrow:IsShown(), "active ascending sort arrow not shown")
+    expect(headers["Имя"].sortArrow.texture:find("Media\\arrow-up", 1, true), "ascending direction does not use arrow texture")
+    Click("Имя"); Order({ E, O, D1, D2, G, B, A }, "name descending or stable ties incorrect")
+    expect(headers["Имя"].sortArrow.texture:find("Media\\arrow-down", 1, true), "descending direction does not use arrow texture")
     Click("Ур."); Order({ B, G, D1, D2, A, E, O }, "first level click no longer sorts highest first")
-    expect(not headers["Имя / класс"].sortArrow:IsShown(), "inactive column still shows a direction arrow")
+    expect(not headers["Имя"].sortArrow:IsShown(), "inactive column still shows a direction arrow")
     Click("Ур."); Order({ O, E, A, D1, D2, G, B }, "level reverse did not sort lowest first")
     Click("Звание"); Order({ B, G, D1, D2, A, E, O }, "rank sorted translated labels instead of numeric native hierarchy")
     Click("Звание"); Order({ O, A, E, D1, D2, B, G }, "reverse native rank ordering or stable ties incorrect")
@@ -1421,6 +1431,211 @@ end
 local function ClassRow(stats, token)
     for _, row in ipairs(stats.rows) do if row.class == token then return row end end
 end
+local function LevelRow(stats, lower, upper)
+    for _, row in ipairs(stats.rows) do
+        if row.lower == lower and row.upper == upper then return row end
+    end
+end
+local function UnknownLevelRow(stats)
+    for _, row in ipairs(stats.rows) do if row.unknown then return row end end
+end
+local function LevelModelFixture()
+    local c, freshness = StatsFixture()
+    local function Member(name, guild, level, online)
+        return { name = name, guild = guild, class = "MAGE", level = level, online = online, rank = 2, rankName = "Участник", zone = "Локация" }
+    end
+    c.U.own = {
+        [c.name] = Member(c.name, 1, 1, true),
+        ["Nine Realm"] = Member("Nine Realm", 1, 9, false),
+        ["Ten Realm"] = Member("Ten Realm", 1, 10, true),
+        ["Nineteen Realm"] = Member("Nineteen Realm", 1, 19, false),
+        ["Twenty Realm"] = Member("Twenty Realm", 1, 20, true),
+        ["Fiftynine Realm"] = Member("Fiftynine Realm", 1, 59, false),
+        ["Sixty Realm"] = Member("Sixty Realm", 1, 60, true),
+        ["ten realm"] = Member("ten realm", 1, 10, true),
+        corrupt = false,
+    }
+    c.U.db.rosters[1] = { rows = c.U.own, at = c.U.stamp() }
+    c.U.db.rosters[2] = { at = c.U.stamp(), rows = {
+        ["Remote Sixty"] = Member("Remote Sixty", 2, 60, true),
+        ["Sixtyone Realm"] = Member("Sixtyone Realm", 2, 61, false),
+        ["Sixtynine Realm"] = Member("Sixtynine Realm", 2, 69, true),
+        ["Seventy Realm"] = Member("Seventy Realm", 2, 70, false),
+        ["Ninetynine Realm"] = Member("Ninetynine Realm", 2, 99, true),
+        ["Hundred Realm"] = Member("Hundred Realm", 2, 100, false),
+        ["String Realm"] = Member("String Realm", 2, "20", true),
+        ["Zero Realm"] = Member("Zero Realm", 2, 0, false),
+        ["Missing Realm"] = Member("Missing Realm", 2, nil, true),
+        corrupt = "not a member",
+    } }
+    return c, freshness
+end
+do
+    local c = LevelModelFixture()
+    local stats = c.U.LevelStatistics()
+    eq(stats.step, 10, "default level grouping changed")
+    eq(stats.total, 16, "level statistics dropped characters or counted aliases twice")
+    eq(stats.online, 9, "level statistics did not preserve online flags")
+    eq(stats.guilds[1].total, 7, "own level total counts case aliases twice")
+    eq(stats.guilds[2].total, 9, "remote level total dropped unknown or high levels")
+    eq(LevelRow(stats, 1, 9).total, 2, "first decade must cover levels 1 through 9")
+    eq(LevelRow(stats, 10, 19).total, 2, "decade boundary misplaced level 10 or 19")
+    eq(LevelRow(stats, 50, 59).total, 1, "level 59 was lost beside cap")
+    eq(LevelRow(stats, 60, 60).total, 2, "level 60 must have its own cap bucket")
+    eq(LevelRow(stats, 60, 60).online, 2, "cap online total incorrect")
+    eq(LevelRow(stats, 61, 69).total, 2, "valid levels above cap were dropped")
+    eq(LevelRow(stats, 70, 79).total, 1, "observed higher decade is missing")
+    eq(LevelRow(stats, 90, 99).total, 1, "level 99 escaped its extra bucket")
+    eq(LevelRow(stats, 100, 100).total, 1, "accepted maximum level was dropped")
+    eq(UnknownLevelRow(stats).total, 3, "missing, zero or string level was lost")
+    eq(UnknownLevelRow(stats).online, 2, "unknown level online count incorrect")
+    eq(LevelRow(stats, 30, 39).total, 0, "known absent bucket should be zero")
+    local total, online = 0, 0
+    for _, row in ipairs(stats.rows) do
+        total, online = total + row.total, online + row.online
+        eq(row.guilds[1].total + row.guilds[2].total, row.total, "level guild subtotals do not reconcile")
+    end
+    eq(total, stats.total, "level buckets do not cover the entire roster")
+    eq(online, stats.online, "online level buckets do not cover the entire roster")
+    stats = c.U.LevelStatistics(5)
+    eq(LevelRow(stats, 1, 4).total, 1, "five-level grouping first boundary incorrect")
+    eq(LevelRow(stats, 5, 9).total, 1, "five-level grouping misplaced level 9")
+    eq(LevelRow(stats, 10, 14).total, 1, "five-level grouping misplaced level 10")
+    eq(LevelRow(stats, 15, 19).total, 1, "five-level grouping misplaced level 19")
+    eq(LevelRow(stats, 55, 59).total, 1, "five-level grouping included cap in preceding row")
+    eq(LevelRow(stats, 61, 64).total, 1, "five-level grouping dropped level 61")
+    eq(LevelRow(stats, 65, 69).total, 1, "five-level grouping dropped level 69")
+    eq(LevelRow(stats, 60, 60).total, 2, "five-level grouping combined cap with another row")
+    stats = c.U.LevelStatistics(1)
+    eq(LevelRow(stats, 1, 1).total, 1, "individual level view misplaced first level")
+    eq(LevelRow(stats, 59, 59).total, 1, "individual level view misplaced level 59")
+    eq(LevelRow(stats, 60, 60).total, 2, "individual level view lost cap members")
+    eq(LevelRow(stats, 61, 61).total, 1, "individual level view lost high-level members")
+    eq(LevelRow(stats, 100, 100).total, 1, "individual level view lost maximum level")
+    eq(#stats.rows, 66, "individual view should keep 60 standard levels, five observed higher levels and unknown")
+    for _, step in ipairs({ 0, 2, 100, "5", false, {} }) do
+        eq(c.U.LevelStatistics(step).step, 10, "unsupported step did not use default grouping")
+    end
+end
+do
+    local c, freshness = LevelModelFixture()
+    freshness[2] = false
+    local stats = c.U.LevelStatistics(10)
+    eq(stats.total, 16, "stale roster erased cached level membership")
+    expect(stats.complete and not stats.onlineComplete and stats.online == nil, "stale online total presented as current")
+    eq(stats.knownOnline, 4, "stale remote flags leaked into known online count")
+    eq(stats.guilds[2].total, 9, "stale remote level population changed")
+    expect(stats.guilds[2].online == nil, "stale remote online count should be unknown")
+    eq(LevelRow(stats, 60, 60).knownOnline, 1, "cap known online count includes stale presence")
+    expect(LevelRow(stats, 60, 60).online == nil, "stale cap population shown with precise online count")
+    c.U.db.rosters[2] = nil
+    stats = c.U.LevelStatistics(10)
+    expect(not stats.complete and stats.total == nil and stats.online == nil, "missing guild presented as a complete population")
+    eq(stats.knownTotal, 7, "missing remote roster erased own level subtotal")
+    expect(not stats.guilds[2].known and stats.guilds[2].total == nil, "missing guild presented as zero")
+    expect(LevelRow(stats, 30, 39).total == nil, "missing guild falsely certifies an empty level bucket")
+    eq(LevelRow(stats, 30, 39).knownTotal, 0, "known empty subtotal should remain zero")
+    freshness[2] = true; c.U.db.rosters[2] = { rows = {}, at = c.U.stamp() }
+    stats = c.U.LevelStatistics(10)
+    expect(stats.complete and stats.onlineComplete, "known empty guild is incomplete")
+    eq(stats.total, 7, "known empty guild changed own member total")
+    eq(stats.online, 4, "known empty guild changed own online total")
+    eq(stats.guilds[2].total, 0, "known empty guild should show zero")
+    expect(not UnknownLevelRow(stats), "empty unknown group should not be emitted")
+    c.U.own[c.name] = nil
+    stats = c.U.LevelStatistics(10)
+    expect(not stats.guilds[1].known and stats.total == nil, "incomplete own roster treated as authoritative")
+    eq(stats.knownTotal, 0, "own roster without self should not contribute a partial population")
+end
+do
+    local c = LevelModelFixture()
+    local member = c.U.own[c.name]
+    c.U.own = { [c.name] = member }
+    c.U.db.rosters[2] = { rows = {}, at = c.U.stamp() }
+    local function CheckUnknown(level)
+        member.level = level
+        local stats = c.U.LevelStatistics(10)
+        eq(stats.total, 1, "corrupt level dropped its character from the population")
+        local row = UnknownLevelRow(stats)
+        expect(row and row.total == 1 and row.online == 1, "corrupt level not counted in visible unknown bucket")
+    end
+    CheckUnknown(nil)
+    for _, value in ipairs({ false, {}, "60", 0, -1, 101, 1.5, math.huge, -math.huge, 0 / 0 }) do CheckUnknown(value) end
+    member.level = 60
+    expect(not UnknownLevelRow(c.U.LevelStatistics()), "valid level left behind an unknown bucket")
+    c.E.LOCALIZED_CLASS_NAMES_MALE = { WARRIOR = "Localized Warrior" }
+    c.E.RAID_CLASS_COLORS = { WARRIOR = { r = 0.2, g = 0.3, b = 0.4 } }
+    local info = c.U.ClassInfo(" WARRIOR ")
+    eq(info.class, "WARRIOR", "shared class metadata does not normalize whitespace")
+    eq(info.label, "Localized Warrior", "shared class metadata ignored localized label")
+    eq(info.color.r, 0.2, "shared class metadata ignored runtime class color")
+    info.color.r = 1
+    eq(c.U.ClassInfo("WARRIOR").color.r, 0.2, "consumer changed shared class metadata through returned table")
+    for _, value in ipairs({ false, 7, {}, "" }) do
+        eq(c.U.ClassInfo(value).class, "UNKNOWN", "invalid class escaped shared unknown metadata")
+    end
+    eq(c.U.ClassInfo().class, "UNKNOWN", "missing class escaped shared unknown metadata")
+    eq(c.U.ClassInfo("DEATHKNIGHT").label, "DEATHKNIGHT", "unknown observed class token lost its readable fallback")
+end
+print("PASS level statistics boundaries, cap, high levels, aliases, corrupt values, freshness and shared class metadata")
+
+do
+    local c = StatsFixture()
+    c.E.LOCALIZED_CLASS_NAMES_MALE = { MAGE = "Алая магия", WARRIOR = "Средний воин", PRIEST = "Ясный жрец" }
+    local function Member(name, guild, class)
+        return { name = name, guild = guild, class = class, online = true, level = 20, rank = 2, rankName = "Участник", zone = "Локация" }
+    end
+    c.U.own = {
+        [c.name] = Member(c.name, 1, "PRIEST"),
+        ["Alpha Priest"] = Member("Alpha Priest", 1, "PRIEST"),
+        ["Twin Mage"] = Member("Twin Mage", 1, "MAGE"),
+        ["Unknown One"] = Member("Unknown One", 1, nil),
+    }
+    c.U.db.rosters[1] = { rows = c.U.own, at = c.U.stamp() }
+    c.U.db.rosters[2] = { at = c.U.stamp(), rows = {
+        ["Beta Warrior"] = Member("Beta Warrior", 2, "WARRIOR"),
+        ["Twin Mage"] = Member("Twin Mage", 2, "MAGE"),
+        ["Unknown Two"] = Member("Unknown Two", 2, {}),
+    } }
+    c.U.OpenRoster()
+    local classHeader, nameHeader, search
+    for _, frame in ipairs(c.allFrames) do
+        if frame.sortTitle == "Класс" then classHeader = frame end
+        if frame.sortTitle == "Имя" then nameHeader = frame end
+        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+    end
+    expect(classHeader and nameHeader and classHeader ~= nameHeader, "roster needs independent name and class sort controls")
+    eq(classHeader:GetText(), "Класс", "class header label is not explicit")
+    local function Order(expected, reason)
+        local actual = {}
+        for _, frame in ipairs(c.allFrames) do
+            if frame.row and frame:IsShown() then actual[#actual + 1] = frame.row.name .. "@" .. frame.row.guild end
+        end
+        eq(table.concat(actual, ","), table.concat(expected, ","), reason)
+    end
+    classHeader.scripts.OnClick(classHeader)
+    Order({ "Twin Mage@1", "Twin Mage@2", "Beta Warrior@2", "Alpha Priest@1", c.name .. "@1", "Unknown One@1", "Unknown Two@2" }, "class ascending must use localized labels, stable name/guild ties and unknown last")
+    expect(classHeader.sortArrow:IsShown() and classHeader.sortArrow.texture:find("Media\\arrow-up", 1, true), "class ascending arrow missing")
+    for _, frame in ipairs(c.allFrames) do
+        if frame.row and frame:IsShown() then
+            local info = c.U.ClassInfo(frame.row.class)
+            expect(frame.classText, "roster class is not rendered in a separate column")
+            eq(frame.classText:GetText(), info.label, "class column did not use localized class label")
+            eq(frame.classText.textColor[1], info.color.r, "class column red channel differs from shared class metadata")
+            eq(frame.classText.textColor[2], info.color.g, "class column green channel differs from shared class metadata")
+            eq(frame.classText.textColor[3], info.color.b, "class column blue channel differs from shared class metadata")
+        end
+    end
+    classHeader.scripts.OnClick(classHeader)
+    Order({ "Alpha Priest@1", c.name .. "@1", "Beta Warrior@2", "Twin Mage@1", "Twin Mage@2", "Unknown One@1", "Unknown Two@2" }, "class descending must reverse classes while preserving name/guild ties and unknown last")
+    expect(classHeader.sortArrow.texture:find("Media\\arrow-down", 1, true), "class descending arrow missing")
+    search:SetText("АЛАЯ МАГИЯ"); search.scripts.OnTextChanged(search, true)
+    Order({ "Twin Mage@1", "Twin Mage@2" }, "roster search does not match localized class labels case-insensitively")
+    search:SetText(c.U.ClassInfo().label); search.scripts.OnTextChanged(search, true)
+    Order({ "Unknown One@1", "Unknown Two@2" }, "unknown class label cannot be found through roster search")
+end
+print("PASS separate localized class column, colored labels, stable class sorting in both directions and localized class search")
+
 do
     local c, freshness = StatsFixture()
     local stats = c.U.ClassStatistics()
@@ -1479,9 +1694,9 @@ do
     for _, frame in ipairs(c.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
         if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
-        if frame.text == "Весь союз" then guildFilter = frame end
-        if frame.text == "По классам" then openStats = frame end
-        if frame.text == "К списку" then back = frame end
+        if frame.text == "Весь союз" and not frame.czuLevelAction then guildFilter = frame end
+        if frame.text == "Статистика" then openStats = frame end
+        if frame.text == "К списку" and frame.czuLevelAction ~= "back" then back = frame end
     end
     expect(search and offline and guildFilter and openStats and back, "class statistics navigation missing for ordinary member")
     expect(not c.U.IsMaster() and not c.U.IsOfficer(), "statistics UI fixture unexpectedly has officer privileges")
@@ -1524,6 +1739,162 @@ do
     expect(back.parent:IsShown(), "public class statistics action did not reopen the page")
 end
 print("PASS ordinary-member class statistics navigation, independence from roster filters and live/unknown counter updates")
+do
+    local c, freshness = LevelModelFixture()
+    c.U.own.corrupt, c.U.db.rosters[2].rows.corrupt = nil, nil
+    c.U.OpenRoster()
+    local search, offline, guildFilter, statistics, toLevels, classBack
+    for _, frame in ipairs(c.allFrames) do
+        if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
+        if frame.frameType == "CheckButton" and frame.parent and frame.parent.move then offline = frame end
+        if frame.text == "Весь союз" and not frame.czuLevelAction then guildFilter = frame end
+        if frame.text == "Статистика" then statistics = frame end
+        if frame.text == "По уровням" then toLevels = frame end
+        if frame.text == "К списку" and not frame.czuLevelAction then classBack = frame end
+    end
+    expect(search and offline and guildFilter and statistics and toLevels and classBack, "roster statistics navigation is incomplete")
+    expect(not c.U.IsMaster() and not c.U.IsOfficer(), "level chart fixture unexpectedly has officer privileges")
+    search:SetText(c.name); search.scripts.OnTextChanged(search, true)
+    offline:SetChecked(false); offline.scripts.OnClick(offline)
+    guildFilter.scripts.OnClick(guildFilter)
+    local selectedGuild = guildFilter:GetText()
+    local rosterTab = c.E.ChillZoneUnionWindowTab1
+    statistics.scripts.OnClick(statistics)
+    expect(classBack.parent:IsShown(), "statistics action did not open class statistics")
+    toLevels.scripts.OnClick(toLevels)
+    local chart = c.E.ChillZoneUnionLevelStatistics
+    expect(chart and chart:IsShown() and not classBack.parent:IsShown(), "class page did not open separate level chart")
+    expect(rosterTab and rosterTab.nativeTabSelected and rosterTab.czuSelected, "level chart lost its parent roster tab selection")
+    local controls = {}
+    for _, frame in ipairs(c.allFrames) do
+        if frame.parent == chart and frame.czuLevelAction then
+            controls[frame.czuLevelAction] = frame
+            eq(frame.frameType, "Button", "level chart control is not a native button")
+        end
+    end
+    for _, action in ipairs({ "back", "classes", "refresh", "scope", "mode", "step", "previous", "next" }) do
+        expect(controls[action] and controls[action].scripts.OnClick, "level chart control missing: " .. action)
+    end
+    local function Click(action) controls[action].scripts.OnClick(controls[action]) end
+    local function Visible(lower, upper, unknown)
+        for _, frame in ipairs(c.allFrames) do
+            local row = frame.levelRow
+            if frame.parent == chart and row and frame:IsShown() and
+                ((unknown and row.unknown) or (not unknown and row.lower == lower and row.upper == upper)) then return frame end
+        end
+        error("visible level chart row missing: " .. tostring(lower) .. "-" .. tostring(upper))
+    end
+    local function First()
+        for _, frame in ipairs(c.allFrames) do if frame.parent == chart and frame.levelRow and frame:IsShown() then return frame end end
+        error("level chart has no visible rows")
+    end
+    local function TooltipText()
+        local lines = { c.E.GameTooltip:GetText() }
+        for _, line in ipairs(c.E.GameTooltip.lines or {}) do lines[#lines + 1] = line[1] end
+        return table.concat(lines, "\n")
+    end
+    eq(controls.scope:GetText(), "Весь союз", "default chart scope must include both guilds")
+    eq(controls.mode:GetText(), "Все персонажи", "default chart must show all characters")
+    eq(controls.step:GetText(), "По 10 уровней", "default chart grouping is not ten levels")
+    local first = Visible(1, 9)
+    eq(first.name:GetText(), first.levelRow.label, "level chart label is inconsistent with its boundaries")
+    eq(first.value:GetText(), "2", "level chart totals depend on roster filters")
+    eq(first.counts:GetText(), "1 / 2", "level chart lost online/total counters")
+    eq(first.bar.frameType, "StatusBar", "level distribution is not rendered as native StatusBar")
+    eq(first.bar.minValue, 0, "level chart bars must start at zero")
+    eq(first.bar.maxValue, 3, "bar scale ignores an off-page peak")
+    eq(first.bar.value, 2, "bar value differs from displayed count")
+    expect(first.bar:IsShown() and first.bar.statusBarTexture, "positive level count has no visible textured bar")
+    local zero = Visible(30, 39)
+    eq(zero.value:GetText(), "0", "known zero level bucket is not rendered as zero")
+    expect(not zero.bar:IsShown(), "known zero level bucket has a misleading positive bar")
+    expect(chart.range and chart.range:GetText():find("12", 1, true), "chart range omits off-page rows")
+    expect(not controls.previous:IsEnabled() and controls.next:IsEnabled(), "initial chart paging state is incorrect")
+    local visibleCount = 0
+    for _, frame in ipairs(c.allFrames) do if frame.parent == chart and frame.levelRow and frame:IsShown() then visibleCount = visibleCount + 1 end end
+    eq(visibleCount, 11, "level chart must show eleven graph rows per page")
+    first.scripts.OnEnter(first)
+    local tip = TooltipText()
+    expect(c.E.GameTooltip:IsShown() and tip:find(c.U.GUILDS[1] .. ": 1 / 2", 1, true) and tip:find(c.U.GUILDS[2] .. ": 0 / 0", 1, true), "chart tooltip omits guild online/total breakdown")
+    expect(tip:find("12.5%", 1, true), "chart tooltip share is not relative to selected full population")
+    first.scripts.OnLeave(first); expect(not c.E.GameTooltip:IsShown(), "level chart tooltip remains open after pointer leaves")
+    Click("next")
+    local unknown = Visible(nil, nil, true)
+    eq(unknown.value:GetText(), "3", "unknown levels were confused with unknown roster population")
+    eq(unknown.counts:GetText(), "2 / 3", "unknown-level online/total count incorrect")
+    eq(unknown.bar.value, 3, "unknown-level count is missing from graph")
+    eq(unknown.bar.maxValue, 3, "chart scale changes between pages")
+    unknown.scripts.OnEnter(unknown)
+    expect(TooltipText():find("Уровень неизвестен", 1, true), "unknown-level tooltip suggests a numeric level")
+    Click("previous")
+    eq(First().levelRow.lower, 1, "previous arrow did not restore first graph page")
+    chart.scripts.OnMouseWheel(chart, -1)
+    expect(First().levelRow.lower > 1, "mouse wheel did not scroll graph rows")
+    chart.scripts.OnMouseWheel(chart, 1)
+    eq(First().levelRow.lower, 1, "mouse wheel did not return to graph start")
+    Click("scope")
+    eq(controls.scope:GetText(), c.U.GUILDS[1], "scope did not switch to first guild")
+    eq(Visible(1, 9).value:GetText(), "2", "first-guild scope shows another guild's members")
+    eq(Visible(1, 9).bar.maxValue, 2, "scope did not recalculate peak over selected guild")
+    Click("scope")
+    eq(controls.scope:GetText(), c.U.GUILDS[2], "scope did not switch to second guild")
+    eq(Visible(1, 9).value:GetText(), "0", "second-guild empty bucket inherited first-guild population")
+    expect(not Visible(1, 9).bar:IsShown(), "empty selected-guild bucket has a visible bar")
+    Click("scope")
+    eq(controls.scope:GetText(), "Весь союз", "scope does not cycle back to union")
+    Click("mode")
+    eq(controls.mode:GetText(), "В сети", "chart mode did not switch to online characters")
+    eq(Visible(1, 9).value:GetText(), "1", "online chart counted offline characters")
+    eq(Visible(1, 9).counts:GetText(), "1 / 2", "mode switch discarded independent online/total counters")
+    eq(Visible(1, 9).bar.value, 1, "online graph does not use online count")
+    eq(Visible(1, 9).bar.maxValue, 2, "online graph scale uses total population")
+    Click("mode")
+    eq(Visible(1, 9).value:GetText(), "2", "chart mode does not cycle back to all characters")
+    Click("step")
+    eq(controls.step:GetText(), "По 5 уровней", "chart grouping did not switch to five levels")
+    eq(Visible(1, 4).value:GetText(), "1", "five-level graph retained decade counts")
+    eq(Visible(5, 9).value:GetText(), "1", "five-level graph misplaced level nine")
+    Click("step")
+    eq(controls.step:GetText(), "Каждый уровень", "chart grouping did not switch to individual levels")
+    eq(Visible(1, 1).value:GetText(), "1", "individual-level graph retained grouped counts")
+    Click("next")
+    expect(First().levelRow.lower > 1, "individual-level graph cannot page beyond initial levels")
+    Click("previous")
+    eq(First().levelRow.lower, 1, "individual-level previous page did not return to level one")
+    Click("step")
+    eq(controls.step:GetText(), "По 10 уровней", "chart grouping does not cycle back to ten levels")
+    eq(First().levelRow.lower, 1, "grouping change retained an out-of-range scroll offset")
+    c.U.db.rosters[2].rows["New Level"] = { name = "New Level", guild = 2, level = 1, online = false, class = "PRIEST" }
+    c.U.Refresh()
+    eq(Visible(1, 9).value:GetText(), "3", "active level chart did not refresh membership changes")
+    eq(Visible(1, 9).counts:GetText(), "1 / 3", "active level chart counters did not refresh")
+    c.U.db.rosters[2].rows["New Level"] = nil
+    freshness[2] = false; Click("mode"); c.U.Refresh()
+    eq(Visible(1, 9).value:GetText(), "1 + ?", "stale remote online population is shown as a precise number")
+    eq(Visible(1, 9).counts:GetText(), "1 + ? / 2", "stale graph counters lost known online subtotal")
+    eq(Visible(1, 9).bar.value, 1, "stale graph bar includes cached online flags")
+    first = Visible(1, 9); first.scripts.OnEnter(first)
+    tip = TooltipText()
+    expect(tip:find(c.U.GUILDS[2] .. ": ? / 0", 1, true), "tooltip presents stale guild online presence as zero")
+    expect(tip:find("Доля среди известных: 25.0%", 1, true), "stale graph share fails to identify known population")
+    c.U.db.rosters[2] = nil; c.U.Refresh()
+    eq(Visible(1, 9).counts:GetText(), "1 + ? / 2 + ?", "missing remote roster lost known level subtotal or unknown marker")
+    Click("mode")
+    eq(Visible(1, 9).value:GetText(), "2 + ?", "missing guild was rendered as a complete level total")
+    eq(Visible(30, 39).value:GetText(), "?", "missing guild falsely certifies an empty level population")
+    expect(not Visible(30, 39).bar:IsShown(), "fully unknown level population has a positive bar")
+    Click("back")
+    expect(search.parent:IsShown() and not chart:IsShown(), "level chart back button did not restore member list")
+    expect(not c.E.GameTooltip:IsShown(), "leaving level chart left its tooltip open")
+    eq(search:GetText(), c.name, "level chart navigation discarded roster search")
+    eq(guildFilter:GetText(), selectedGuild, "level chart navigation discarded roster guild filter")
+    eq(offline:GetChecked(), false, "level chart navigation discarded offline filter")
+    c.U.OpenLevelStats()
+    expect(chart:IsShown() and rosterTab.nativeTabSelected, "public level statistics action did not reopen roster statistics")
+    Click("classes")
+    expect(classBack.parent:IsShown() and not chart:IsShown(), "level chart class-navigation action did not restore class statistics")
+end
+print("PASS native level graph navigation, counts, stable scales, scope, mode, grouping, paging, tooltips, unknown data and refresh")
 do
     local c = StatsFixture()
     local byName = {
@@ -1937,9 +2308,9 @@ do
     local roster, search, guildFilter, offline, sortHeader, close = target.parent
     for _, frame in ipairs(owner.allFrames) do
         if frame.frameType == "EditBox" and frame.width == 280 then search = frame end
-        if frame.text == "Весь союз" then guildFilter = frame end
+        if frame.text == "Весь союз" and not frame.czuLevelAction then guildFilter = frame end
         if frame.frameType == "CheckButton" and frame.parent == roster then offline = frame end
-        if frame.sortTitle == "Имя / класс" then sortHeader = frame end
+        if frame.sortTitle == "Имя" then sortHeader = frame end
         if frame.template == "UIPanelCloseButton" then close = frame end
     end
     local function Closes(action, reason)
