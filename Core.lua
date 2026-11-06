@@ -1,6 +1,6 @@
 local _, U = ...
 ChillZoneUnion = U
-U.VERSION, U.PREFIX = "0.9.1-beta", "CZUnion3"
+U.VERSION, U.PREFIX = "0.9.2-beta", "CZUnion3"
 U.GUILDS = { "Чиллзон", "Чиллзон Навсегда" }
 U.GUILD_LEADERS = { [1] = "Вован Дубан" }
 U.UNION_LEADER = "Вован Дубан"
@@ -157,8 +157,13 @@ function U.IsUnionLeader(name, guild)
     end
     return rows ~= nil and rows[name] ~= nil and rows[name].rank == 0
 end
-function U.CanInvite()
+function U.CanInvite(name)
     if not U.guild then return false end
+    if name ~= nil and name ~= U.me then
+        name = U.Name(name)
+        local row = name and U.AuthorityRow and U.AuthorityRow(name)
+        return row ~= nil and U.RankCanInvite(row.rank) or false
+    end
     if U.IsMaster() then return true end
     local fn = CanGuildInvite or (C_GuildInfo and C_GuildInfo.CanInvite)
     if type(fn) ~= "function" then return false end
@@ -181,22 +186,26 @@ function U.RankPermissionsCurrent()
     end
     return rankPermissionUntil
 end
-function U.RankIsOfficer(rank)
+local function RankPermission(rank, flag)
     if not U.Public(rank) or type(rank) ~= "number" or rank < 0 or rank > 9 or rank ~= math.floor(rank) then return false end
     if rank == 0 then return true end
     -- Forever's OfficerCheckbox uses permission 22; roster ranks start at zero,
     -- while GuildControlGetRankFlags takes a one-based order. Do not change the
     -- guild-control UI selection or infer authority from names/invitation rights.
     U.RankPermissionsCurrent()
-    if rankPermissions[rank] ~= nil then return rankPermissions[rank] end
+    if rankPermissions[rank] ~= nil then return rankPermissions[rank][flag] end
     local fn = rankPermissionAPI
     if type(fn) ~= "function" then return false end
     local ok, flags = pcall(fn, rank + 1)
-    if not ok or not U.Public(flags) or type(flags) ~= "table" then rankPermissions[rank] = false; return false end
-    local allowed = U.Public(flags[22]) and flags[22] == true
-    rankPermissions[rank] = allowed
-    return allowed
+    local known = ok and U.Public(flags) and type(flags) == "table"
+    rankPermissions[rank] = {
+        [7] = known and U.Public(flags[7]) and flags[7] == true or false,
+        [22] = known and U.Public(flags[22]) and flags[22] == true or false,
+    }
+    return rankPermissions[rank][flag]
 end
+function U.RankIsOfficer(rank) return RankPermission(rank, 22) end
+function U.RankCanInvite(rank) return RankPermission(rank, 7) end
 function U.IsVeteranRankName(rankName)
     return U.Text(rankName, 120) and U.Fold(U.Trim(rankName)) == U.Fold("Ветеран")
 end

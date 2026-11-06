@@ -2,6 +2,9 @@ local _, U = ...
 local lastReady, lastResend = -100, -100
 local acceptRetry, receiptRetry, declineRetry = {}, {}, {}
 local RETRY_FOR, CONFIRM_FOR = 5, 180
+local syncRequest, syncReplies, syncReplyAt, syncProgress, syncPushState = nil, {}, {}, {}, {}
+local syncWindow, syncCount, syncBytes = -100, 0, 0
+local SYNC_REPLY_FOR, SYNC_REPLY_LIMIT, SYNC_REPLY_BYTES = 15, 8, 4096
 function U.Tickets()
     U.db.tickets = U.db.tickets or {}
     return U.db.tickets
@@ -97,9 +100,225 @@ end
 local function FieldsMatch(t, f)
     return t and tonumber(f[1]) == t.source and f[2] == t.id and f[3] == t.member and tonumber(f[4]) == t.dest
 end
+local function CancelState(t)
+    if U.CancelQueued then U.CancelQueued("transfer-state:" .. t.id) end
+end
+-- A state reply is a local gateway attestation of an already received consent.
+-- It never supplies the foreign TACK proof that permits the source to leave.
+local function Syncable(t)
+    return ValidTicket(t) and t.dest == U.guild and U.GUILDS[t.source]
+        and t.dest == (t.source == 1 and 2 or 1)
+        and (t.state == "accepted" or t.state == "ready")
+        and ValidNonce(t.acceptNonce) and t.receiptReady == t.acceptNonce
+        and U.Name(t.member) == t.member and U.Name(t.master) == t.master
+        and U.Text(t.id, 40) and t.id ~= ""
+        and ((t.authorityGuild or t.source) == t.source
+            or (t.authorityGuild == t.dest and U.IsUnionLeader(t.master, t.dest)))
+end
+local function StateProof(t, state)
+    local fields = U.Pack({ t.source, t.id, t.member, t.dest, t.master, t.created,
+        t.authorityGuild or t.source, t.acceptNonce or "", state, t.receiptReady or "" })
+    local hash = 5381
+    for i = 1, #fields do hash = (hash * 33 + fields:byte(i)) % 4294967291 end
+    return tostring(hash)
+end
+function U.TransferSyncRequest(force)
+    if not U.db or not U.guild or not U.me or not (U.CanInvite() or U.CanRelay()) then return false end
+    local gateway, now = U.GatewayName(), U.clock()
+    if not gateway or gateway == U.me or not U.own[gateway] or not U.CanRelay(gateway) then return false end
+    if not force and syncRequest and syncRequest.guild == U.guild and syncRequest.gateway == gateway then return true end
+    syncRequest = { guild = U.guild, gateway = gateway, nonce = U.NewID(), untilAt = now + CONFIRM_FOR, nextAt = now }
+    return true
+end
+local function SyncCandidates()
+    local candidates, signature = {}, {}
+    for _, t in pairs(U.Tickets()) do if Syncable(t) then candidates[#candidates + 1] = t end end
+    table.sort(candidates, function(a, b) return a.id < b.id end)
+    for _, t in ipairs(candidates) do signature[#signature + 1] = U.Pack({ t.id, t.acceptNonce, t.state }) end
+    return candidates, table.concat(signature)
+end
+function U.TransferSyncFor(name, nonce, ack)
+    name = U.Name(name)
+    if not U.db or not U.guild or not OwnGateway() or not name or name == U.me or not U.own[name]
+        or not (U.CanRelay(name) or U.CanInvite(name))
+        or nonce ~= nil and not ValidNonce(nonce) or ack ~= nil and not ValidNonce(ack) then return false end
+    -- Both requests and HELLO pushes are limited to invitation-capable clients
+    -- and backup relays. Ordinary members cannot consume the reply budget.
+    local _, signature = SyncCandidates()
+    if nonce == nil and (signature == "" or syncPushState[name] == signature) then return false end
+    local now, count = U.clock(), 0
+    local progress = syncProgress[name]
+    if not progress or progress.nonce ~= (nonce or "") or progress.signature ~= signature then
+        progress = { nonce = nonce or "", cursor = "", signature = signature, at = now }
+        syncProgress[name] = progress
+    elseif progress.batch and ack == progress.batch.token then
+        progress.cursor, progress.batch = progress.batch.cursor, nil
+    end
+    for peer, reply in pairs(syncReplies) do
+        if reply.untilAt < now or not U.own[peer] then syncReplies[peer] = nil else count = count + 1 end
+    end
+    local reply = syncReplies[name]
+    if not reply then
+        if count >= 32 then return false end
+        reply = { cursor = progress.cursor,
+            nextAt = math.max(now, (syncReplyAt[name] or -100) + RETRY_FOR) }
+        syncReplies[name] = reply
+    end
+    if reply.nonce and reply.nonce ~= (nonce or "") then
+        if nonce == nil then return true end
+        reply.cursor = ""
+    end
+    reply.nonce, reply.signature, reply.untilAt = nonce or "", signature, now + SYNC_REPLY_FOR
+    reply.cursor = progress.cursor
+    return true
+end
+local function SyncTick(now)
+    if syncRequest then
+        if syncRequest.guild ~= U.guild or syncRequest.gateway ~= U.GatewayName() then
+            syncRequest = nil
+            U.TransferSyncRequest()
+        elseif not syncRequest.complete and now <= syncRequest.untilAt and now >= syncRequest.nextAt then
+            if U.own[U.me] and U.own[syncRequest.gateway] and U.CanRelay(syncRequest.gateway)
+                and (U.CanInvite() or U.CanRelay()) then
+                local fields = { U.guild, syncRequest.gateway, U.me, syncRequest.nonce }
+                if syncRequest.ack then fields[5] = syncRequest.ack end
+                U.Queue("TSYNC", fields, "GUILD", nil, false, false, nil, false, now + RETRY_FOR)
+            end
+            syncRequest.nextAt = now + RETRY_FOR
+        end
+    end
+    if not OwnGateway() then syncReplies = {}; return end
+    if now - syncWindow >= 10 then syncWindow, syncCount, syncBytes = now, 0, 0 end
+    local names = {}
+    for name, reply in pairs(syncReplies) do
+        if reply.untilAt < now or not U.own[name] or not (U.CanRelay(name) or U.CanInvite(name)) then syncReplies[name] = nil
+        elseif now >= reply.nextAt then names[#names + 1] = name end
+    end
+    table.sort(names, function(a, b)
+        local aa, ba = syncReplyAt[a] or -100, syncReplyAt[b] or -100
+        if aa ~= ba then return aa < ba end
+        return a < b
+    end)
+    for index, name in ipairs(names) do
+        if syncCount >= 8 or syncBytes >= SYNC_REPLY_BYTES then
+            for i = index, #names do
+                local pending = syncReplies[names[i]]
+                pending.nextAt = syncWindow + 10
+                pending.untilAt = math.max(pending.untilAt, pending.nextAt + SYNC_REPLY_FOR)
+            end
+            break
+        end
+        local reply = syncReplies[name]
+        local candidates, signature = SyncCandidates()
+        local progress = syncProgress[name]
+        if not progress or progress.nonce ~= reply.nonce or progress.signature ~= signature then
+            progress = { nonce = reply.nonce, cursor = "", signature = signature, at = now }
+            syncProgress[name], reply.cursor = progress, ""
+        end
+        local jobs, manifest, bytes, cursor = {}, {}, 0, reply.cursor
+        for _, t in ipairs(candidates) do
+            if t.id > reply.cursor then
+                local fields = { U.guild, name, reply.nonce, t.source, t.id, t.member, t.dest,
+                    t.master, t.created, t.authorityGuild or t.source, t.acceptNonce, t.state, t.receiptReady }
+                local size = #U.Pack(fields) + 7
+                if #jobs >= SYNC_REPLY_LIMIT or bytes + size > SYNC_REPLY_BYTES - 1280 then break end
+                jobs[#jobs + 1] = { kind = "TSTATE", fields = fields, dist = "GUILD", priority = false,
+                    requiresGateway = true, expiresAt = now + RETRY_FOR, cancelKey = "transfer-state:" .. t.id }
+                bytes, cursor = bytes + size, t.id
+                manifest[#manifest + 1] = U.Pack({ t.id, t.acceptNonce, t.state, StateProof(t, t.state) })
+            end
+        end
+        local more = #candidates > 0 and cursor < candidates[#candidates].id
+        local token = progress.batch and progress.batch.token or U.NewID()
+        local control = { U.guild, name, reply.nonce, more and "MORE" or "END", token, U.Pack(manifest) }
+        jobs[#jobs + 1] = { kind = "TSTATE", fields = control,
+            dist = "GUILD", priority = false, requiresGateway = true, expiresAt = now + RETRY_FOR }
+        bytes = bytes + #U.Pack(control) + 7
+        if syncBytes + bytes > SYNC_REPLY_BYTES then
+            reply.nextAt = syncWindow + 10
+            reply.untilAt = math.max(reply.untilAt, reply.nextAt + SYNC_REPLY_FOR)
+        elseif U.QueueBatch(jobs) then
+            -- An explicit request replays this page until its manifest token is
+            -- acknowledged. Queue reservation alone cannot advance its cursor.
+            progress.batch = { token = token, cursor = more and cursor or "" }
+            progress.at = now
+            syncReplyAt[name], syncCount, syncBytes = now, syncCount + 1, syncBytes + bytes
+            if reply.nonce == "" and more then
+                progress.cursor, progress.batch, reply.cursor, reply.nextAt = cursor, nil, cursor, now + RETRY_FOR
+            else
+                syncPushState[name] = signature
+                syncReplies[name] = nil
+            end
+        else reply.nextAt = now + 1 end
+    end
+    for name, at in pairs(syncReplyAt) do if now - at > CONFIRM_FOR then syncReplyAt[name] = nil end end
+    for name, progress in pairs(syncProgress) do if now - progress.at > CONFIRM_FOR or not U.own[name] then syncProgress[name] = nil end end
+    for name in pairs(syncPushState) do if not U.own[name] then syncPushState[name] = nil end end
+end
+local function TakeState(f, sender, remote)
+    if remote or (#f ~= 13 and #f ~= 6) or tonumber(f[1]) ~= U.guild or f[2] ~= U.me or not U.own[sender]
+        or sender ~= U.GatewayName() or not U.CanRelay(sender) then return false end
+    if f[3] ~= "" and (not ValidNonce(f[3]) or not syncRequest or syncRequest.guild ~= U.guild
+        or syncRequest.gateway ~= sender or syncRequest.nonce ~= f[3] or U.clock() > syncRequest.untilAt) then return false end
+    if #f == 6 then
+        if (f[4] ~= "END" and f[4] ~= "MORE") or not ValidNonce(f[5]) then return false end
+        local manifest = U.Unpack(f[6], SYNC_REPLY_LIMIT)
+        if not manifest then return false end
+        for _, packed in ipairs(manifest) do
+            local item = U.Unpack(packed, 4)
+            if not item or #item ~= 4 or not U.Text(item[1], 40) or item[1] == "" or not ValidNonce(item[2])
+                or (item[3] ~= "accepted" and item[3] ~= "ready") or not item[4]:match("^%d+$") then return false end
+            local t = U.Tickets()[item[1]]
+            if not t then return false end
+            local terminal = t.state == "declined" or t.state == "replaced" or t.state == "done" or not CurrentTicket(t)
+            if not terminal and (not Syncable(t) or t.acceptNonce ~= item[2]
+                or t.state ~= item[3] and not (t.state == "ready" and item[3] == "accepted")
+                or StateProof(t, item[3]) ~= item[4]) then return false end
+        end
+        if f[3] ~= "" then
+            syncRequest.ack = f[5]
+            if f[4] == "END" then syncRequest.complete = true end
+        end
+        return true
+    end
+    local source, dest, created, authority = tonumber(f[4]), tonumber(f[7]), tonumber(f[9]), tonumber(f[10])
+    local member, master = U.Name(f[6]), U.Name(f[8])
+    if not source or not U.GUILDS[source] or dest ~= U.guild or dest ~= (source == 1 and 2 or 1)
+        or member ~= f[6] or not member or master ~= f[8] or not master
+        or not U.Text(f[5], 40) or f[5] == "" or not created
+        or not ValidNonce(f[11]) or f[13] ~= f[11] or (f[12] ~= "accepted" and f[12] ~= "ready")
+        or (authority ~= source and (authority ~= dest or not U.IsUnionLeader(master, dest))) then return false end
+    local incoming = { id = f[5], source = source, dest = dest, member = member, master = master,
+        created = created, authorityGuild = authority, acceptNonce = f[11], receiptReady = f[13], state = f[12] }
+    if not CurrentTicket(incoming) or U.own[member] then return false end
+    local tickets, existing = U.Tickets(), U.Tickets()[incoming.id]
+    if existing then
+        if not ValidTicket(existing) or (existing.state ~= "proposed" and existing.state ~= "accepted" and existing.state ~= "ready")
+            or existing.source ~= source or existing.dest ~= dest or existing.member ~= member or existing.master ~= master
+            or existing.created ~= created or (existing.authorityGuild or existing.source) ~= authority
+            or existing.acceptNonce and existing.acceptNonce ~= incoming.acceptNonce then return false end
+        existing.acceptNonce, existing.receiptReady = incoming.acceptNonce, incoming.receiptReady
+        if existing.state ~= "ready" then existing.state = incoming.state end
+    else
+        for _, other in pairs(tickets) do
+            if FreshTicket(other) and SameRoute(other, incoming) and NewerTicket(incoming, other) then
+                CancelState(other)
+                other.state, other.confirmedNonce, other.receiptReady, other.left = "replaced", nil, nil, nil
+            end
+        end
+        tickets[incoming.id] = incoming
+    end
+    if U.Refresh then U.Refresh() end
+    return true
+end
 function U.TransferMessage(kind, f, sender, remote, context)
     local tickets = U.Tickets()
-    if kind == "TICKET" or kind == "UTICKET" then
+    if kind == "TSYNC" then
+        if remote or (#f ~= 4 and #f ~= 5) or tonumber(f[1]) ~= U.guild or f[2] ~= U.me or f[3] ~= sender
+            or not U.own[sender] or not (U.CanRelay(sender) or U.CanInvite(sender)) or not ValidNonce(f[4]) then return false end
+        return U.TransferSyncFor(sender, f[4], f[5])
+    elseif kind == "TSTATE" then return TakeState(f, sender, remote)
+    elseif kind == "TICKET" or kind == "UTICKET" then
         local union = kind == "UTICKET"
         if #f ~= (union and 7 or 6) then return false end
         local src, dest, member, master, created = tonumber(f[1]), tonumber(f[4]), U.Name(f[3]), U.Name(f[5]), tonumber(f[6])
@@ -135,6 +354,7 @@ function U.TransferMessage(kind, f, sender, remote, context)
             if FreshTicket(other) and SameRoute(other, incoming) then
                 if NewerTicket(other, incoming) then incoming.state = "replaced"
                 elseif NewerTicket(incoming, other) then
+                    CancelState(other)
                     other.state, other.confirmedNonce, other.receiptReady, other.left = "replaced", nil, nil, nil
                 end
             end
@@ -154,6 +374,7 @@ function U.TransferMessage(kind, f, sender, remote, context)
             if U.TrustedPeer(sender) ~= t.source or t.dest ~= U.guild then return false end
         elseif sender ~= t.member or U.guild ~= t.source or not U.own[sender] then return false end
         if kind == "DECLINE" then
+            CancelState(t)
             t.state, t.confirmedNonce, t.receiptReady, t.left = "declined", nil, nil, nil
             t.declinedAt = t.declinedAt or U.stamp()
             if U.Refresh then U.Refresh() end
@@ -281,6 +502,7 @@ function U.TransferTick()
         if not FreshTicket(t) then
             tickets[id], acceptRetry[id], receiptRetry[id], declineRetry[id] = nil, nil, nil, nil
         elseif ValidTicket(t) and t.dest == U.guild and U.own[t.member] then
+            CancelState(t)
             t.state, t.receiptReady = "done", nil
         elseif ValidTicket(t) and t.member == U.me and t.source == U.guild and t.state == "accepted" and not U.TransferConfirmed(t) then
             t.state, t.acceptError = "accept_error", true
@@ -302,6 +524,7 @@ function U.TransferTick()
             declineRetry[id] = now + RETRY_FOR
         end
     end
+    SyncTick(now)
     if U.guild and U.IsGateway() and U.Connected() and U.remote then
         for id, t in pairs(tickets) do
             if ValidTicket(t) and t.dest == U.guild and t.state == "accepted" and t.receiptReady == t.acceptNonce

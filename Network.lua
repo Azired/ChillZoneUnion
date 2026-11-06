@@ -305,6 +305,7 @@ function U.OnRosterReady()
     U.SayHello(); lastPing = -100
     nativeReadyAt = U.clock() + 2
     if RequestHistory then RequestHistory(false) end
+    if U.TransferSyncRequest then U.TransferSyncRequest(true) end
 end
 local function SendPing(name, introduction)
     if not U.guild or not U.CanRelay() or not Alive(U.me) or not U.TrustedPeer(name) or (not introduction and not U.IsGateway()) then return false end
@@ -858,6 +859,10 @@ function U.Handle(kind, f, dist, sender, id)
                 elseif U.linkState and U.linkState.gateway == sender then U.linkState = nil end
             end
             if U.linkState and U.linkState.gateway ~= gateway then U.linkState = nil end
+            -- Returning clients may retain a proposed ticket after missing its
+            -- consent/READY broadcasts. Resync only through the current gateway.
+            if U.TransferSyncFor then U.TransferSyncFor(sender) end
+            if sender == gateway and U.TransferSyncRequest then U.TransferSyncRequest() end
             if fresh and U.IsGateway() then
                 U.SayHello()
                 if U.ExtensionSync then U.ExtensionSync("guild") end
@@ -869,6 +874,9 @@ function U.Handle(kind, f, dist, sender, id)
             end
         elseif kind == "CONTACT" then
             if #f == 2 and tonumber(f[2]) == U.OtherGuild() and U.IsTrustOfficer(sender) then U.ApproveContact(f[1], f[2]); lastPing = -100 end
+        elseif kind == "TSYNC" or kind == "TSTATE" then
+            -- Local state recovery never crosses the inter-guild relay.
+            U.TransferMessage(kind, f, sender, false)
         elseif kind == "REMOTE" then
             if #f ~= 3 or sender ~= U.GatewayName() then return end
             local fields = U.Unpack(f[2])
@@ -954,6 +962,7 @@ function U.NetworkTick()
     if U.linkState and U.linkState.gateway ~= gateway then U.linkState = nil end
     if gateway ~= lastGateway then
         lastGateway = gateway
+        if U.TransferSyncRequest then U.TransferSyncRequest(true) end
         if gateway == U.me then
             -- A new gateway starts a fair round; known-addon candidates
             -- win the initial unprobed tie instead of inheriting old probes.

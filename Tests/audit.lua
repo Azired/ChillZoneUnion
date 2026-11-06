@@ -14,6 +14,9 @@ return { NewClient = NewClient, Step = Step, SetRosters = SetRosters, Count = Co
     SetFilter = function(filter) deliveryFilter = filter end,
     Advance = function(seconds) time = time + seconds end,
     ClearWire = function() wire = {} end,
+    RemoveClient = function(client)
+        for i = #clients, 1, -1 do if clients[i] == client then table.remove(clients, i) end end
+    end,
     Now = function() return time end }
 ]]))()
 local failed, ran, serial = 0, 0, 700000
@@ -93,11 +96,132 @@ local function Proposal(gm, member)
     assert(latest, "proposal missing at participant")
     return latest
 end
-local function IsKind(packet, kind) return packet.text:find("~R" .. kind .. "~", 1, true) ~= nil end
+local observedWire = setmetatable({}, { __mode = "k" })
+local function WireMessage(packet)
+    local id, part, total, encoded = packet.text:match("^([^~]+)~(%d+)~(%d+)~(.*)$")
+    if not encoded then return nil end
+    part, total = tonumber(part), tonumber(total)
+    if total > 1 then
+        local buffers = observedWire[packet.from] or {}; observedWire[packet.from] = buffers
+        local key = id .. ":" .. packet.dist
+        local buffer = buffers[key] or { parts = {}, count = 0 }; buffers[key] = buffer
+        if not buffer.parts[part] then buffer.parts[part], buffer.count = encoded, buffer.count + 1 end
+        if buffer.count ~= total then return nil end
+        encoded = table.concat(buffer.parts)
+    end
+    local raw
+    if encoded:sub(1, 1) == "R" then raw = encoded:sub(2)
+    elseif encoded:sub(1, 1) == "Z" then
+        local D = packet.from.U.Deflate
+        local zipped = D and D:DecodeForWoWAddonChannel(encoded:sub(2))
+        raw = zipped and D:DecompressDeflateLimited(zipped, 25000)
+    end
+    local kind, payload
+    if raw then kind, payload = raw:match("^([A-Z]+)~(.*)$") end
+    return kind, payload and packet.from.U.Unpack(payload)
+end
+local function IsKind(packet, kind) return WireMessage(packet) == kind end
 local function Has(c, text)
     local count = 0
     for _, row in ipairs(c.U.history) do if row.text == text then count = count + 1 end end
     return count
+end
+local function Copy(value)
+    if type(value) ~= "table" then return value end
+    local out = {}; for key, item in pairs(value) do out[key] = Copy(item) end
+    return out
+end
+local function Login(c)
+    c.live = true; H.SetRosters(0)
+    c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN")
+end
+local function OfflineReady()
+    local gm, relay, member, invite, all = World(true)
+    local t = Proposal(gm, member)
+    local saved = Copy(invite.E.ChillZoneUnionDB)
+    invite.live = false; H.SetRosters(0)
+    member.U.AcceptTransfer(t.id, true); H.Step(15)
+    eq(t.state, "accepted", "offline-officer fixture never received destination ACK")
+    member.U.LeaveForTransfer(t.id); eq(member.command, "/gquit", "confirmed fixture could not prepare leave")
+    member.guild = nil; member.U.frame.scripts.OnEvent(member.U.frame, "PLAYER_GUILD_UPDATE", "player")
+    H.SetRosters(0); H.Step(12)
+    eq(relay.U.Tickets()[t.id].state, "ready", "offline-officer fixture gateway missed READY")
+    eq(invite.U.Tickets()[t.id].state, "proposed", "offline-officer fixture observed consent while absent")
+    return gm, relay, member, invite, t, saved, all
+end
+local function ReadyGroup(count)
+    local gm, relay, member, invite = World(true)
+    invite.live = false
+    local members, tickets = { member }, {}
+    for i = 2, count do members[i] = H.NewClient(string.format("Budget Member%02d", i), 1, 2) end
+    H.SetRosters(0)
+    for i = 2, count do members[i].U.frame.scripts.OnEvent(members[i].U.frame, "PLAYER_LOGIN") end
+    H.Step(30)
+    for _, participant in ipairs(members) do assert(gm.U.CreateTransfer(participant.name)) end
+    H.Step(35)
+    for _, participant in ipairs(members) do
+        local ticket
+        for _, candidate in pairs(participant.U.Tickets()) do
+            if candidate.member == participant.name and candidate.state == "proposed" then ticket = candidate; break end
+        end
+        assert(ticket, "budget participant did not receive actual proposal")
+        tickets[#tickets + 1] = ticket
+        assert(participant.U.AcceptTransfer(ticket.id, true))
+    end
+    H.Step(60)
+    for i, participant in ipairs(members) do
+        eq(tickets[i].state, "accepted", "budget participant missed actual destination ACK")
+        participant.U.LeaveForTransfer(tickets[i].id)
+        eq(participant.command, "/gquit", "budget participant could not prepare leave")
+        participant.guild = nil; participant.U.frame.scripts.OnEvent(participant.U.frame, "PLAYER_GUILD_UPDATE", "player")
+    end
+    H.SetRosters(0); H.Step(65)
+    for _, ticket in ipairs(tickets) do eq(relay.U.Tickets()[ticket.id].state, "ready", "budget gateway missed actual READY") end
+    return gm, relay, invite, tickets
+end
+local function StateFields(relay, target, t, nonce)
+    return { relay.U.guild, target.name, nonce or "", t.source, t.id, t.member, t.dest,
+        t.master, t.created, t.authorityGuild or t.source, t.acceptNonce or "", t.state, t.receiptReady or "" }
+end
+-- Keep live gateway advertisements while admitting only explicitly queued
+-- snapshot probes. This isolates hostile packets from automatic catch-up.
+local function StateProbe(target)
+    local allowed = {}
+    H.SetFilter(function(packet, receiver)
+        if receiver ~= target then return true end
+        if IsKind(packet, "HELLO") then return true end
+        return allowed[packet.text:match("^([^~]+)~")] == true
+    end)
+    return function(sender, fields, distribution)
+        serial = serial + 1; local id = tostring(serial); allowed[id] = true
+        local dist = distribution or "GUILD"
+        local native, accepted = target.U.TransferMessage, nil
+        target.U.TransferMessage = function(kind, ...)
+            local result = native(kind, ...)
+            if kind == "TSTATE" then accepted = result end
+            return result
+        end
+        assert(sender.U.Queue("TSTATE", fields, dist, dist == "WHISPER" and target.name or nil, true, false, id), "snapshot probe queue rejected")
+        H.Step(3)
+        target.U.TransferMessage = native
+        if dist == "GUILD" and target.U.GatewayName() == sender.name and target.U.CanRelay(sender.name) then
+            assert(accepted ~= nil, "authenticated snapshot probe never reached production transfer handler")
+        end
+        return accepted
+    end
+end
+local function TicketUI(c, id)
+    c.U.OpenRoster()
+    local render = Upvalue(c.U.Refresh, "RenderTickets")
+    render()
+    local rows = Upvalue(render, "ticketRows")
+    for _, row in ipairs(rows) do
+        if row.ticket and row.ticket.id == id then
+            row.scripts.OnClick(row)
+            return row, Upvalue(render, "inviteButton"), Upvalue(render, "states")
+        end
+    end
+    error("transfer UI omitted requested ticket")
 end
 
 Scenario("one ordinary member cannot exhaust multipart slots", function()
@@ -311,6 +435,485 @@ Scenario("Veteran READY reaches a separate destination invite officer", function
     local before = #invite.U.history
     invite.U.Handle("REMOTE", { "CHAT", invite.U.Pack({ 1, member.name, "forged from ticket", "1:fake:ticket", invite.U.stamp() }), member.name }, "GUILD", relay.name, "790000")
     eq(#invite.U.history, before, "transfer-member exception authorized non-READY remote traffic")
+end)
+
+Scenario("returning destination officer recovers READY after missing consent and leave", function()
+    local gm, relay, member, invite = World(true)
+    local t = Proposal(gm, member)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "destination officer never received original proposal")
+    invite.live = false; H.SetRosters(0)
+    member.U.AcceptTransfer(t.id, true); H.Step(15)
+    eq(t.state, "accepted", "destination did not confirm offline-officer transfer")
+    member.U.LeaveForTransfer(t.id); eq(member.command, "/gquit", "confirmed member could not prepare leave")
+    member.guild = nil; member.U.frame.scripts.OnEvent(member.U.frame, "PLAYER_GUILD_UPDATE", "player")
+    H.SetRosters(0); H.Step(12)
+    eq(relay.U.Tickets()[t.id].state, "ready", "Veteran gateway did not receive guildless READY")
+    eq(invite.U.Tickets()[t.id].state, "proposed", "offline officer unexpectedly observed live consent")
+    invite.live = true; H.SetRosters(0)
+    invite.U.frame.scripts.OnEvent(invite.U.frame, "PLAYER_LOGIN")
+    H.Step(120)
+    print("AUDIT offline transfer: gateway=" .. relay.U.Tickets()[t.id].state .. "; returning officer=" .. invite.U.Tickets()[t.id].state)
+    eq(invite.U.Tickets()[t.id].state, "ready", "returning invite officer retained proposed after 120 seconds")
+    invite.U.InviteTransfer(t.id); eq(invite.command, "/ginvite " .. member.name, "recovered officer could not prepare invitation")
+    relay.command = nil; relay.U.InviteTransfer(t.id)
+    assert(not relay.command, "Veteran gateway gained invitation permission")
+end)
+
+Scenario("cold destination restart upgrades saved proposed and enables bound invitation UI", function()
+    local gm, relay, member, old, t, saved = OfflineReady()
+    H.RemoveClient(old)
+    local invite = H.NewClient(old.name, 2, 1, saved)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "cold restart did not load stale saved proposal")
+    Login(invite); H.Step(120, true)
+    local recovered = invite.U.Tickets()[t.id]
+    eq(recovered and recovered.state, "ready", "cold destination restart did not recover READY")
+    local row, button, states = TicketUI(invite, t.id)
+    eq(row.ticket, recovered, "rendered transfer row is not bound to recovered ticket")
+    assert(row:GetText():find(states.ready, 1, true), "transfer row did not render ready status")
+    assert(button:IsEnabled(), "recovered ready ticket did not enable invitation button")
+    button.scripts.OnClick(button)
+    eq(invite.command, "/ginvite " .. member.name, "ready UI did not prepare native invitation")
+    local veteranRow, veteranButton = TicketUI(relay, t.id)
+    eq(veteranRow.ticket.state, "ready", "Veteran UI missed ready status")
+    assert(not veteranButton:IsEnabled(), "Veteran relay without invite permission acquired enabled invitation UI")
+    veteranButton.scripts.OnClick(veteranButton)
+    assert(not relay.command, "Veteran invitation callback bypassed native invitation permission")
+end)
+
+Scenario("new destination officer learns active accepted and ready ticket bodies", function()
+    local gm, relay, member, invite = World(true)
+    local t = Proposal(gm, member)
+    member.U.AcceptTransfer(t.id, true); H.Step(15)
+    local newcomer = H.NewClient("New Destination Officer", 2, 1)
+    eq(H.Count(newcomer.U.Tickets()), 0, "new destination client unexpectedly had a saved ticket")
+    local acceptedSnapshots = 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == newcomer and fields then
+            if kind == "REMOTE" and (fields[1] == "TICKET" or fields[1] == "ACCEPT") then return false end
+            if kind == "TSTATE" and #fields == 13 and fields[12] == "accepted" then acceptedSnapshots = acceptedSnapshots + 1 end
+        end
+        return true
+    end)
+    Login(newcomer); H.Step(60)
+    local received = newcomer.U.Tickets()[t.id]
+    eq(received and received.state, "accepted", "new destination officer did not learn accepted state")
+    eq(received.member, t.member, "catch-up omitted ticket member")
+    eq(received.master, t.master, "catch-up changed proposal authority")
+    eq(received.created, t.created, "catch-up changed immutable creation time")
+    assert(acceptedSnapshots > 0, "new officer recovered through legacy retransmit without receiving accepted snapshot")
+    H.SetFilter(nil)
+    member.U.LeaveForTransfer(t.id)
+    member.guild = nil; member.U.frame.scripts.OnEvent(member.U.frame, "PLAYER_GUILD_UPDATE", "player")
+    H.SetRosters(0); H.Step(15)
+    eq(received.state, "ready", "new destination officer did not advance to ready")
+    local later = H.NewClient("Later Destination Officer", 2, 1)
+    Login(later); H.Step(60)
+    eq(later.U.Tickets()[t.id] and later.U.Tickets()[t.id].state, "ready", "new officer could not learn complete ready ticket after source member left")
+    assert(not later.U.TransferConfirmed(later.U.Tickets()[t.id]), "destination snapshot acquired participant leave confirmation")
+end)
+
+Scenario("returning officer catches up from replacement Veteran gateway", function()
+    local gm, relay, member, invite, t, saved = OfflineReady()
+    local backup = H.NewClient("B Veteran Backup", 2, 4, saved)
+    backup.officer, backup.rankName, backup.invitePermission = false, relay.rankName, false
+    Login(backup); H.Step(60)
+    eq(backup.U.Tickets()[t.id] and backup.U.Tickets()[t.id].state, "ready", "backup did not learn ticket before endpoint failed")
+    relay.live = false; H.SetRosters(0); H.Step(140)
+    assert(backup.U.IsGateway(), "offline officer fixture did not elect replacement Veteran gateway")
+    Login(invite); H.Step(120)
+    eq(invite.U.Tickets()[t.id].state, "ready", "returning officer did not recover state from current replacement gateway")
+    invite.U.InviteTransfer(t.id); eq(invite.command, "/ginvite " .. member.name, "gateway replacement blocked recovered invitation")
+end)
+
+Scenario("lost state request and reply retry over GUILD with duplicate delivery", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    local requests, replies, droppedRequest, droppedReply = 0, 0, 0, 0
+    H.SetFilter(function(packet, receiver)
+        if packet.from == invite and receiver == relay and IsKind(packet, "TSYNC") then
+            requests = requests + 1
+            if droppedRequest == 0 then droppedRequest = 1; return false end
+        end
+        local kind, fields = WireMessage(packet)
+        if packet.from == relay and receiver == invite and kind == "TSTATE" and fields then
+            if fields[3] == "" then return false end -- isolate request/reply recovery from HELLO pushes
+            if #fields == 13 then
+                replies = replies + 1
+                if droppedReply == 0 then droppedReply = 1; return false end
+            end
+        end
+        return true
+    end)
+    Login(invite); assert(invite.U.TransferSyncRequest(true)); H.Step(120, true)
+    eq(droppedRequest, 1, "fixture did not drop a real state request")
+    eq(droppedReply, 1, "fixture did not drop a real state snapshot")
+    assert(requests >= 2 and replies >= 2, "state recovery did not retry both dropped request and reply")
+    eq(invite.U.Tickets()[t.id].state, "ready", "lost state transport left destination officer stale")
+    H.SetFilter(nil)
+end)
+
+Scenario("seventeen-ticket pagination retries a lost middle-page row before advancing", function()
+    local gm, relay, member, invite = World(true)
+    invite.live = false
+    local members = { member }
+    for i = 2, 17 do members[i] = H.NewClient(string.format("Paged Member%02d", i), 1, 2) end
+    H.SetRosters(0)
+    for i = 2, #members do members[i].U.frame.scripts.OnEvent(members[i].U.frame, "PLAYER_LOGIN") end
+    H.Step(30)
+    for _, participant in ipairs(members) do assert(gm.U.CreateTransfer(participant.name), "paged transfer proposal rejected") end
+    H.Step(35)
+    local tickets = {}
+    for _, participant in ipairs(members) do
+        local ticket
+        for _, candidate in pairs(participant.U.Tickets()) do
+            if candidate.member == participant.name and candidate.state == "proposed" then ticket = candidate; break end
+        end
+        assert(ticket, "paged participant never received proposal")
+        tickets[#tickets + 1] = ticket
+        assert(participant.U.AcceptTransfer(ticket.id, true), "paged participant could not accept")
+    end
+    H.Step(60)
+    for i, participant in ipairs(members) do
+        eq(tickets[i].state, "accepted", "paged participant never received destination ACK")
+        participant.U.LeaveForTransfer(tickets[i].id)
+        eq(participant.command, "/gquit", "paged participant could not prepare leave")
+        participant.guild = nil; participant.U.frame.scripts.OnEvent(participant.U.frame, "PLAYER_GUILD_UPDATE", "player")
+    end
+    H.SetRosters(0); H.Step(65)
+    for _, ticket in ipairs(tickets) do eq(relay.U.Tickets()[ticket.id].state, "ready", "paged gateway did not receive all READY messages") end
+    local seen, unique, dropped, controls, acknowledgements, packets = {}, 0, nil, 0, 0, 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if packet.from == invite and receiver == relay and kind == "TSYNC" and fields and #fields == 5 then
+            acknowledgements = acknowledgements + 1
+        end
+        if packet.from == relay and receiver == invite and kind == "TSTATE" and fields then
+            if fields[3] == "" then return false end
+            packets = packets + 1
+            if #fields == 13 then
+                if not seen[fields[5]] then seen[fields[5]], unique = true, unique + 1 end
+                if unique == 9 and not dropped then dropped = fields[5]; return false end
+            elseif #fields == 6 then controls = controls + 1 end
+        end
+        return true
+    end)
+    Login(invite); H.Step(25)
+    assert(invite.U.TransferSyncRequest(true), "pagination requester never discovered live gateway")
+    H.Step(120, true)
+    assert(dropped, "pagination fixture did not drop a middle-page ticket")
+    assert(controls >= 3 and acknowledgements >= 2, "state synchronization did not paginate with explicit batch acknowledgements")
+    for _, ticket in ipairs(tickets) do
+        eq(invite.U.Tickets()[ticket.id] and invite.U.Tickets()[ticket.id].state, "ready", "lost middle page left a destination ticket missing or stale")
+    end
+    assert(packets <= 200, "bounded pagination emitted excessive snapshot traffic: " .. packets)
+    H.SetFilter(nil)
+end)
+
+Scenario("full requesting queue retries state synchronization after admission recovers", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    Login(invite); invite.U.ClearQueue(); invite.locked = true
+    for i = 1, 1500 do assert(invite.U.Queue("TEST", { "x" }, "GUILD", nil, false)) end
+    eq(invite.U.QueueSize(), 1500, "request queue saturation fixture did not fill queue")
+    assert(type(invite.U.TransferSyncRequest) == "function", "state request API missing")
+    local block, requests = true, 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if packet.from == invite and receiver == relay and kind == "TSYNC" then requests = requests + 1 end
+        if receiver == invite and kind == "TSTATE" and fields then return not block and fields[3] ~= "" end
+        return true
+    end)
+    invite.U.TransferSyncRequest(true); H.Step(8)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "blocked request fixture unexpectedly recovered")
+    invite.U.ClearQueue(); invite.locked = false
+    block = false; H.Step(120)
+    eq(invite.U.Tickets()[t.id].state, "ready", "queue refusal consumed state synchronization retry")
+    assert(requests > 0, "request admission recovery never retried actual state transport")
+    H.SetFilter(nil)
+end)
+
+Scenario("full gateway queue retains pending snapshot response for retry", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    relay.U.ClearQueue(); relay.locked = true
+    for i = 1, 1500 do assert(relay.U.Queue("TEST", { "x" }, "GUILD", nil, false)) end
+    local requests, replies = 0, 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if packet.from == invite and receiver == relay and kind == "TSYNC" then requests = requests + 1 end
+        if receiver == invite and kind == "TSTATE" and fields then
+            if fields[3] == "" then return false end
+            if #fields == 13 then replies = replies + 1 end
+        end
+        return true
+    end)
+    Login(invite); assert(invite.U.TransferSyncRequest(true)); H.Step(8)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "full gateway queue unexpectedly delivered snapshot")
+    relay.U.ClearQueue(); relay.locked = false; H.Step(120)
+    eq(invite.U.Tickets()[t.id].state, "ready", "gateway queue refusal discarded pending catch-up")
+    assert(requests > 0 and replies > 0, "gateway admission recovery did not use request/reply state transport")
+    H.SetFilter(nil)
+end)
+
+Scenario("ordinary destination member cannot request or queue transfer-state replies", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    local ordinary = H.NewClient("Ordinary State Requester", 2, 2)
+    Login(ordinary); H.Step(25)
+    assert(not ordinary.U.CanInvite() and not relay.U.CanInvite(ordinary.name) and not relay.U.CanRelay(ordinary.name), "ordinary requester unexpectedly has native transfer privileges")
+    local calls, replies, nativeMessage, nativeBatch = 0, 0, relay.U.TransferMessage, relay.U.QueueBatch
+    relay.U.TransferMessage = function(kind, fields, sender, ...)
+        local before = relay.U.QueueSize()
+        local result = nativeMessage(kind, fields, sender, ...)
+        if kind == "TSYNC" and sender == ordinary.name then
+            calls = calls + 1
+            eq(result, false, "ordinary member TSYNC was admitted by production handler")
+            eq(relay.U.QueueSize(), before, "rejected TSYNC changed the outgoing queue")
+        end
+        return result
+    end
+    relay.U.QueueBatch = function(items)
+        local result = nativeBatch(items)
+        if result then for _, item in ipairs(items) do
+            if item.kind == "TSTATE" and item.fields[2] == ordinary.name then replies = replies + 1 end
+        end end
+        return result
+    end
+    assert(ordinary.U.Queue("TSYNC", { 2, relay.name, ordinary.name, ordinary.U.NewID() }, "GUILD", nil, false))
+    H.Step(25)
+    assert(calls > 0, "ordinary request never reached real GUILD handler")
+    eq(replies, 0, "ordinary request created a deferred state reply")
+    eq(relay.U.TransferSyncFor(ordinary.name, "1.777"), false, "direct sync scheduling API admitted ordinary member")
+    relay.U.TransferMessage, relay.U.QueueBatch = nativeMessage, nativeBatch
+end)
+
+Scenario("invitation-only rank receives state and native flag revocation cancels pending replies", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    local inviter = H.NewClient("Invitation Only Reader", 2, 3)
+    inviter.officer, inviter.invitePermission, inviter.rankName = false, true, "Member"
+    local permission = true
+    for _, c in ipairs({ relay, inviter }) do
+        local native = c.E.C_GuildInfo.GuildControlGetRankFlags
+        c.E.C_GuildInfo.GuildControlGetRankFlags = function(order)
+            local flags = native(order)
+            if order == 4 then flags[7], flags[22] = permission, false end
+            return flags
+        end
+        c.U.frame.scripts.OnEvent(c.U.frame, "GUILD_RANKS_UPDATE")
+    end
+    Login(inviter); H.Step(60)
+    assert(inviter.U.CanInvite() and relay.U.CanInvite(inviter.name), "native flag 7 did not authorize invitation-only reader")
+    assert(not inviter.U.CanRelay() and not relay.U.CanRelay(inviter.name) and not inviter.U.IsOfficer(), "invitation-only native flag granted relay or officer authority")
+    eq(inviter.U.Tickets()[t.id] and inviter.U.Tickets()[t.id].state, "ready", "invitation-only reader did not receive authenticated state")
+    inviter.U.InviteTransfer(t.id); eq(inviter.command, "/ginvite " .. member.name, "native invitation-only permission did not enable ready invite")
+    local admitted, rejected, replies, nativeMessage, nativeBatch = 0, 0, 0, relay.U.TransferMessage, relay.U.QueueBatch
+    relay.U.TransferMessage = function(kind, fields, sender, ...)
+        local result = nativeMessage(kind, fields, sender, ...)
+        if kind == "TSYNC" and sender == inviter.name then
+            if result then admitted = admitted + 1 else rejected = rejected + 1 end
+        end
+        return result
+    end
+    relay.U.QueueBatch = function(items)
+        local result = nativeBatch(items)
+        if result then for _, item in ipairs(items) do
+            if item.kind == "TSTATE" and item.fields[2] == inviter.name then replies = replies + 1 end
+        end end
+        return result
+    end
+    relay.U.ClearQueue(); relay.locked = true
+    for i = 1, 1500 do assert(relay.U.Queue("TEST", { "x" }, "GUILD", nil, false)) end
+    assert(inviter.U.TransferSyncRequest(true)); H.Step(8)
+    assert(admitted > 0, "eligible request was not pending before native revocation")
+    eq(replies, 0, "saturated gateway unexpectedly queued pending response")
+    permission, inviter.invitePermission = false, false
+    for _, c in ipairs({ relay, inviter }) do c.U.frame.scripts.OnEvent(c.U.frame, "GUILD_RANKS_UPDATE") end
+    assert(not inviter.U.CanInvite() and not relay.U.CanInvite(inviter.name), "native rank event retained revoked flag 7 permission")
+    assert(not relay.U.CanRelay(inviter.name), "revoked invitation-only reader acquired relay fallback")
+    relay.U.ClearQueue(); relay.locked = false
+    assert(inviter.U.Queue("TSYNC", { 2, relay.name, inviter.name, inviter.U.NewID() }, "GUILD", nil, false))
+    H.Step(25)
+    assert(rejected > 0, "revoked invitation-only requester was not refused")
+    eq(replies, 0, "pending or new response survived native invitation revocation")
+    inviter.command = nil; inviter.U.InviteTransfer(t.id)
+    assert(not inviter.command, "revoked invitation-only native permission still enabled invitation")
+    relay.U.TransferMessage, relay.U.QueueBatch = nativeMessage, nativeBatch
+end)
+
+Scenario("aggregate state records and controls stay within 4096 bytes while native chat delivers", function()
+    local gm, relay, invite, tickets = ReadyGroup(4)
+    local requesters = {}
+    for i = 1, 12 do requesters[i] = H.NewClient(string.format("Budget Inviter%02d", i), 2, 1) end
+    H.SetRosters(0)
+    local syncTick = Upvalue(relay.U.TransferTick, "SyncTick")
+    local windows, controls, records, totalBytes, nativeBatch = {}, 0, 0, 0, relay.U.QueueBatch
+    relay.U.QueueBatch = function(items)
+        local result = nativeBatch(items)
+        if result then for _, item in ipairs(items) do if item.kind == "TSTATE" then
+            assert(item.priority ~= true, "state catch-up occupied the urgent chat queue")
+            local window = Upvalue(syncTick, "syncWindow")
+            local bytes = #("TSTATE~" .. relay.U.Pack(item.fields))
+            windows[window], totalBytes = (windows[window] or 0) + bytes, totalBytes + bytes
+            assert(windows[window] <= 4096, "aggregate records plus controls exceeded 4096 bytes in ten-second window: " .. windows[window])
+            if #item.fields == 6 then controls = controls + 1 else records = records + 1 end
+        end end end
+        return result
+    end
+    for _, requester in ipairs(requesters) do requester.U.frame.scripts.OnEvent(requester.U.frame, "PLAYER_LOGIN") end
+    H.Step(4)
+    assert(records > 0 and controls > 0, "state load fixture did not enqueue records and batch controls")
+    local nativeText, queuedText = "native chat during state recovery", "ordinary queue chat during state recovery"
+    relay.U.frame.scripts.OnEvent(relay.U.frame, "CHAT_MSG_GUILD", nativeText, relay.name .. "-ForeverRealm")
+    assert(relay.U.Queue("CHAT", { 2, relay.name, queuedText, "2:audit:budget-chat", relay.U.stamp() }, "GUILD", nil, false, true))
+    H.Step(10)
+    eq(Has(gm, nativeText), 1, "actual native guild chat was lost under state synchronization load")
+    eq(Has(requesters[1], queuedText), 1, "ordinary chat queue was starved by state synchronization")
+    H.Step(46)
+    assert(totalBytes > 4096 and H.Count(windows) >= 2, "aggregate budget fixture never crossed a ten-second byte window")
+    local maxWindow = 0; for _, bytes in pairs(windows) do maxWindow = math.max(maxWindow, bytes) end
+    print("AUDIT state budget: windows=" .. H.Count(windows) .. "; max window=" .. maxWindow .. "; raw bytes=" .. totalBytes .. "; records=" .. records .. "; controls=" .. controls)
+    relay.U.QueueBatch = nativeBatch
+end)
+
+Scenario("state snapshot preserves declined done replaced expired and superseded tickets", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    invite.live = true; H.SetRosters(0)
+    local send = StateProbe(invite)
+    local original = Copy(invite.U.Tickets()[t.id])
+    for _, state in ipairs({ "declined", "done", "replaced" }) do
+        invite.U.Tickets()[t.id] = Copy(original); invite.U.Tickets()[t.id].state = state
+        send(relay, StateFields(relay, invite, relay.U.Tickets()[t.id]))
+        eq(invite.U.Tickets()[t.id].state, state, "snapshot reopened terminal " .. state .. " ticket")
+    end
+    invite.U.Tickets()[t.id] = Copy(original)
+    local newer = Copy(original); newer.id = t.id .. ".99"; newer.created = newer.created + 1
+    invite.U.Tickets()[newer.id] = newer
+    send(relay, StateFields(relay, invite, relay.U.Tickets()[t.id]))
+    eq(invite.U.Tickets()[t.id].state, "proposed", "snapshot revived a superseded ticket")
+    invite.U.Tickets()[newer.id] = nil
+    invite.U.Tickets()[t.id] = Copy(original)
+    invite.U.Tickets()[t.id].created = invite.U.stamp() - 1801
+    local expired = Copy(relay.U.Tickets()[t.id]); expired.created = invite.U.Tickets()[t.id].created
+    eq(send(relay, StateFields(relay, invite, expired)), false, "production handler accepted expired snapshot before periodic deletion")
+    assert(not invite.U.Tickets()[t.id], "expired snapshot recreated removed ticket")
+    H.SetFilter(nil)
+end)
+
+Scenario("state snapshot rejects conflicting immutable body consent nonce and receipt", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    invite.live = true; H.SetRosters(0)
+    local send = StateProbe(invite)
+    local fields = StateFields(relay, invite, relay.U.Tickets()[t.id])
+    local probes = { { 4, 2 }, { 6, "Different Member" }, { 7, 1 }, { 8, "Different Master" },
+        { 9, t.created + 1 }, { 10, 2 }, { 11, "1.777" }, { 12, "pending" }, { 13, "1.888" } }
+    for _, change in ipairs(probes) do
+        local bad = Copy(fields); bad[change[1]] = change[2]
+        send(relay, bad)
+        eq(invite.U.Tickets()[t.id].state, "proposed", "conflicting snapshot field " .. change[1] .. " changed ticket state")
+    end
+    invite.U.Tickets()[t.id].acceptNonce = "1.999"
+    send(relay, fields)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "snapshot replaced existing conflicting acceptance nonce")
+    eq(invite.U.Tickets()[t.id].acceptNonce, "1.999", "snapshot rewrote existing acceptance nonce")
+    invite.U.Tickets()[t.id].acceptNonce = nil
+    send(relay, fields)
+    eq(invite.U.Tickets()[t.id].state, "ready", "valid immutable snapshot did not recover after rejection probes")
+    H.SetFilter(nil)
+end)
+
+Scenario("only current native gateway may supply destination state over GUILD", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    invite.live = true; H.SetRosters(0)
+    local ordinary = H.NewClient("Ordinary Destination Member", 2, 2)
+    Login(ordinary); H.Step(1)
+    invite.U.Tickets()[t.id].state = "proposed"
+    local send = StateProbe(invite)
+    local fields = StateFields(relay, invite, relay.U.Tickets()[t.id])
+    send(ordinary, fields)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "ordinary destination member forged ready state")
+    send(gm, fields, "WHISPER")
+    eq(invite.U.Tickets()[t.id].state, "proposed", "remote source gateway forged local destination state")
+    send(relay, fields, "WHISPER")
+    eq(invite.U.Tickets()[t.id].state, "proposed", "state snapshot accepted wrong WHISPER transport")
+    relay.rankName = "Member"; H.SetRosters(0); H.Step(6)
+    assert(not relay.U.CanRelay(), "revocation probe retained native Veteran relay rights")
+    send(relay, fields)
+    eq(invite.U.Tickets()[t.id].state, "proposed", "revoked elected endpoint forged ready state")
+    H.SetFilter(nil)
+end)
+
+Scenario("destination snapshot cannot confirm source participant consent or enable leave", function()
+    local gm, relay, member, invite = World(true)
+    local t = Proposal(gm, member)
+    member.locked = true; assert(member.U.AcceptTransfer(t.id, true))
+    eq(t.state, "pending", "source participant was not waiting for confirmation")
+    local fields = StateFields(relay, member, { source = t.source, id = t.id, member = t.member, dest = t.dest,
+        master = t.master, created = t.created, authorityGuild = t.authorityGuild, acceptNonce = t.acceptNonce,
+        state = "accepted", receiptReady = t.acceptNonce })
+    local send = StateProbe(member)
+    send(relay, fields, "WHISPER")
+    eq(t.state, "pending", "destination state snapshot advanced source consent")
+    fields[1] = member.U.guild
+    send(gm, fields)
+    eq(t.state, "pending", "own source gateway snapshot advanced participant consent")
+    assert(not member.U.TransferConfirmed(t) and not t.confirmedNonce, "snapshot granted destination ACK proof")
+    member.U.LeaveForTransfer(t.id)
+    assert(not member.command, "snapshot enabled source participant to prepare guild leave")
+    H.SetFilter(nil)
+end)
+
+Scenario("forged state completion controls cannot suppress authenticated catch-up retries", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    local ordinary = H.NewClient("Ordinary Control Forger", 2, 2)
+    Login(ordinary); H.Step(1)
+    local requestNonce, requests, allowed = nil, 0, {}
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if packet.from == invite and receiver == relay and kind == "TSYNC" and fields then
+            requestNonce, requests = fields[4], requests + 1
+        end
+        if receiver == invite and kind == "TSTATE" then return allowed[packet.text:match("^([^~]+)~")] == true end
+        return true
+    end)
+    Login(invite); assert(invite.U.TransferSyncRequest(true)); H.Step(3)
+    assert(requestNonce, "fixture did not send authenticated state request")
+    local function Control(sender, nonce, marker, dist, legacyFields)
+        serial = serial + 1; allowed[tostring(serial)] = true
+        local fields = { 2, invite.name, nonce, marker, "1.999888", "" }
+        if legacyFields then for i = 6, legacyFields + 1, -1 do fields[i] = nil end end
+        assert(sender.U.Queue("TSTATE", fields, dist or "GUILD",
+            dist == "WHISPER" and invite.name or nil, true, false, tostring(serial)))
+        H.Step(1)
+    end
+    local before = requests
+    Control(ordinary, requestNonce, "END")
+    Control(gm, requestNonce, "END", "WHISPER")
+    Control(relay, requestNonce .. ".9", "END")
+    Control(relay, requestNonce, "INVALID")
+    Control(relay, requestNonce, "END", nil, 4)
+    Control(relay, requestNonce, "END", nil, 5)
+    H.Step(8)
+    assert(requests > before, "forged completion ended state request retry window")
+    eq(invite.U.Tickets()[t.id].state, "proposed", "forged control changed ticket state")
+    H.SetFilter(nil); H.Step(120)
+    eq(invite.U.Tickets()[t.id].state, "ready", "catch-up did not recover after forged completion probes")
+end)
+
+Scenario("duplicate ready snapshots are idempotent and do not repeat invitation notifications", function()
+    local gm, relay, member, invite, t = OfflineReady()
+    invite.live = true; H.SetRosters(0)
+    local send = StateProbe(invite)
+    local notifications, nativeNotify = 0, invite.U.Notify
+    invite.U.Notify = function(...) notifications = notifications + 1; return nativeNotify(...) end
+    local fields = StateFields(relay, invite, relay.U.Tickets()[t.id])
+    send(relay, fields)
+    eq(invite.U.Tickets()[t.id].state, "ready", "first valid snapshot did not recover ready")
+    local recovered, initial = invite.U.Tickets()[t.id], notifications
+    send(relay, fields); send(relay, fields)
+    eq(invite.U.Tickets()[t.id], recovered, "duplicate snapshot replaced the bound ticket table")
+    eq(notifications, initial, "duplicate ready snapshot repeated invitation notification")
+    fields[12] = "accepted"
+    send(relay, fields)
+    eq(recovered.state, "ready", "older accepted snapshot regressed ready ticket")
+    eq(notifications, initial, "stale accepted snapshot repeated ready notification")
+    H.SetFilter(nil)
 end)
 
 Scenario("guildless READY reaches an uncached replacement gateway and rejects a revoked backup", function()
