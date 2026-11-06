@@ -7,13 +7,14 @@ local boundary = assert(source:find("\nlocal a = NewClient", 1, true))
 source = source:sub(1, boundary - 1)
 -- Optional read-only negative control against the pre-fix module snapshot.
 source = source:gsub('loadfile%("ChillZoneUnion/" %.%. module%)',
-    'loadfile((CZU_AUDIT_SOURCE_ROOT or os.getenv("CZU_AUDIT_SOURCE_ROOT") or "ChillZoneUnion/") .. module)')
+    'loadfile(module == "Transfers.lua" and CZU_AUDIT_TRANSFER_MODULE or ((CZU_AUDIT_SOURCE_ROOT or os.getenv("CZU_AUDIT_SOURCE_ROOT") or "ChillZoneUnion/") .. module))')
 local H = assert(loadstring(source .. "\n" .. [[
 return { NewClient = NewClient, Step = Step, SetRosters = SetRosters, Count = Count,
     Reset = function() clients, wire, deliveryFilter = {}, {}, nil; time = time + 100 end,
     SetFilter = function(filter) deliveryFilter = filter end,
     Advance = function(seconds) time = time + seconds end,
     ClearWire = function() wire = {} end,
+    ReplayPacket = function(packet) wire[#wire + 1] = packet end,
     RemoveClient = function(client)
         for i = #clients, 1, -1 do if clients[i] == client then table.remove(clients, i) end end
     end,
@@ -135,6 +136,19 @@ local function Login(c)
     c.live = true; H.SetRosters(0)
     c.U.frame.scripts.OnEvent(c.U.frame, "PLAYER_LOGIN")
 end
+local function LegacyClient(name, guild, rank, saved)
+    local previous = CZU_AUDIT_TRANSFER_MODULE
+    local path = "tests/fixtures/Transfers-0.9.2.lua"
+    local file = io.open(path, "rb")
+    if file then file:close() else path = "ChillZoneUnion/Tests/fixtures/Transfers-0.9.2.lua" end
+    CZU_AUDIT_TRANSFER_MODULE = path
+    local ok, client = pcall(H.NewClient, name, guild, rank, saved)
+    CZU_AUDIT_TRANSFER_MODULE = previous
+    assert(ok, client)
+    assert(debug.getinfo(client.U.TransferTick, "S").source:find("Transfers-0.9.2.lua", 1, true), "legacy fixture did not load actual 0.9.2 transfer module")
+    client.U.VERSION = "0.9.2-beta"
+    return client
+end
 local function OfflineReady()
     local gm, relay, member, invite, all = World(true)
     local t = Proposal(gm, member)
@@ -179,9 +193,11 @@ local function ReadyGroup(count)
     for _, ticket in ipairs(tickets) do eq(relay.U.Tickets()[ticket.id].state, "ready", "budget gateway missed actual READY") end
     return gm, relay, invite, tickets
 end
-local function GatewayHandoff(empty, donorRank)
+local function GatewayHandoff(empty, donorRank, legacyDonor, advertised)
     local gm, relay, member, invite = World(true)
-    local donor = H.NewClient("ZZ Current Carrier", 2, donorRank or 1, Copy(invite.E.ChillZoneUnionDB))
+    local constructor = legacyDonor and LegacyClient or H.NewClient
+    local donor = constructor("ZZ Current Carrier", 2, donorRank or 1, Copy(invite.E.ChillZoneUnionDB))
+    if advertised ~= nil then donor.U.VERSION = advertised end
     if donorRank == 4 then donor.officer, donor.rankName, donor.invitePermission = false, relay.rankName, false end
     Login(donor); H.Step(25)
     local t = Proposal(gm, member)
@@ -655,6 +671,159 @@ Scenario("eligible carrier returning after initial recovery deadline starts one 
     local completed = requests
     H.Step(80)
     eq(requests, completed, "continuous carrier HELLO repeated completed gateway recovery")
+    H.SetFilter(nil)
+end)
+
+Scenario("twelve real 0.9.2 relays cannot hide a current ready donor at recovery deadline", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    local legacy, legacyNames = {}, {}
+    for i = 1, 12 do
+        local name = string.format("ZA Legacy%02d", i)
+        legacy[i] = LegacyClient(name, 2, 1, Copy(gateway.E.ChillZoneUnionDB)); legacyNames[name] = true
+    end
+    local warming, held, replay, oldRequests, readyRequests, firstReady = true, nil, false, 0, 0, nil
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and kind == "TSYNC" and fields and fields[2] == receiver.name then
+            if legacyNames[receiver.name] then oldRequests = oldRequests + 1 end
+            if receiver == donor then readyRequests, firstReady = readyRequests + 1, firstReady or H.Now() end
+        end
+        if receiver == gateway and packet.from == donor and kind == "TSTATE" and fields then
+            if warming then return false end
+            if #fields == 13 and not replay then held = held or packet; return false end
+        end
+        return true
+    end)
+    H.SetRosters(0)
+    for _, client in ipairs(legacy) do client.U.frame.scripts.OnEvent(client.U.frame, "PLAYER_LOGIN") end
+    donor.U.SayHello(); H.Step(25)
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "mixed-version fixture recovered before controlled round")
+    for _, client in ipairs(legacy) do
+        local info = gateway.U.AddonInfo(client.name, 2)
+        assert(info and info.known and info.live and info.version == "0.9.2-beta", "legacy donor version was not learned over native HELLO")
+    end
+    warming, oldRequests, readyRequests, firstReady = false, 0, 0, nil
+    local started = H.Now()
+    assert(gateway.U.TransferSyncRequest(true)); gateway.U.TransferTick()
+    for i = 1, 190 do H.Step(1); if held then break end end
+    if held then H.Step(1); replay = true; H.ReplayPacket(held); H.Step(10) end
+    local state = gateway.U.Tickets()[t.id] and gateway.U.Tickets()[t.id].state or "missing"
+    print("AUDIT mixed versions: legacy requests=" .. oldRequests .. "; current requests=" .. readyRequests
+        .. "; first current=" .. tostring(firstReady and math.floor(firstReady - started) or "none") .. "; gateway=" .. state)
+    assert(gateway.U.IsGateway(), "mixed-version relays changed elected gateway")
+    eq(oldRequests, 0, "known legacy versions consumed donor slots")
+    eq(state, "ready", "old donor slots hid current ready state at 180-second boundary")
+    assert(held and readyRequests > 0, "mixed-version recovery never exercised delayed actual current donor data")
+    H.SetFilter(nil)
+end)
+
+Scenario("thirty-three silent supported peers allow fair continuation and delayed ready after 180 seconds", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff()
+    local silent, names = {}, {}
+    for i = 1, 33 do
+        local name = string.format("ZA Silent%02d", i)
+        silent[i] = H.NewClient(name, 2, 1, Copy(gateway.E.ChillZoneUnionDB)); names[name] = true
+    end
+    local warming, held, replay, selected, firstReady, requests = true, nil, false, {}, nil, 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and kind == "TSYNC" and fields and fields[2] == receiver.name then
+            selected[receiver.name], requests = true, requests + 1
+            if names[receiver.name] then return false end -- real request loss, while HELLO remains live
+            if receiver == donor then firstReady = firstReady or H.Now() end
+        end
+        if receiver == gateway and packet.from == donor and kind == "TSTATE" and fields then
+            if warming then return false end
+            if #fields == 13 and not replay then held = held or packet; return false end
+        end
+        return true
+    end)
+    H.SetRosters(0)
+    for _, client in ipairs(silent) do client.U.frame.scripts.OnEvent(client.U.frame, "PLAYER_LOGIN") end
+    donor.U.SayHello(); H.Step(25)
+    warming, selected, firstReady, requests = false, {}, nil, 0
+    local started = H.Now()
+    assert(gateway.U.TransferSyncRequest(true)); gateway.U.TransferTick()
+    for i = 1, 560 do H.Step(1); if held then break end end
+    assert(held and firstReady and firstReady - started > 180, "large candidate fixture did not reach delayed donor beyond old global deadline")
+    H.Step(1); replay = true; H.ReplayPacket(held); H.Step(12)
+    assert(gateway.U.IsGateway(), "large supported population changed elected gateway")
+    eq(H.Count(selected), 34, "fair continuation skipped candidates beyond the thirty-two-record cap")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "late selected donor reply was rejected by exhausted global deadline")
+    -- Earlier silent donors can retry within their fixed windows. Let the
+    -- last selected peer's full window expire before testing dormancy.
+    H.Step(190)
+    local completed, completedRequests = H.Count(selected), requests
+    H.Step(70)
+    eq(H.Count(selected), completed, "completed continuation added unexpected candidate selections")
+    eq(requests, completedRequests, "continuous supported HELLO repeated a completed recovery pass")
+    assert(gateway.U.QueueSize() < 100, "continued recovery retained an unbounded outgoing queue")
+    print("AUDIT recovery continuation: candidates=" .. completed .. "; ready after=" .. math.floor(firstReady - started) .. "s")
+    H.SetFilter(nil)
+end)
+
+Scenario("unknown-version fallback recovers within eight peers and does not poll a ninth", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff(false, nil, false, "")
+    local unknown, names = {}, {}
+    for i = 1, 7 do
+        local name = string.format("ZA Unknown%02d", i)
+        unknown[i] = LegacyClient(name, 2, 1, Copy(gateway.E.ChillZoneUnionDB)); unknown[i].U.VERSION = ""; names[name] = true
+    end
+    local ninth = LegacyClient("ZZZ Unknown Ninth", 2, 1, Copy(gateway.E.ChillZoneUnionDB)); ninth.U.VERSION = ""
+    local warming, queried, requests, ninthRequests = true, {}, 0, 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if warming and receiver == gateway and packet.from == donor and kind == "TSTATE" then return false end
+        if packet.from == gateway and kind == "TSYNC" and fields and fields[2] == receiver.name then
+            queried[receiver.name], requests = true, requests + 1
+            if receiver == ninth then ninthRequests = ninthRequests + 1 end
+        end
+        return true
+    end)
+    H.SetRosters(0)
+    for _, client in ipairs(unknown) do client.U.frame.scripts.OnEvent(client.U.frame, "PLAYER_LOGIN") end
+    ninth.U.frame.scripts.OnEvent(ninth.U.frame, "PLAYER_LOGIN"); donor.U.SayHello(); H.Step(25)
+    warming, queried, requests, ninthRequests = false, {}, 0, 0
+    assert(gateway.U.TransferSyncRequest(true)); gateway.U.TransferTick(); H.Step(135)
+    eq(gateway.U.Tickets()[t.id].state, "ready", "unknown fallback did not reach actual eighth ready carrier")
+    eq(H.Count(queried), 8, "unknown fallback did not use exactly eight distinct eligible peers")
+    eq(ninthRequests, 0, "unknown fallback exceeded finite eight-peer allowance")
+    H.Step(190) -- all previously selected peers have exhausted fixed windows
+    local completed = requests
+    H.Step(90)
+    eq(requests, completed, "continuous unknown HELLO restarted exhausted fallback")
+    eq(ninthRequests, 0, "ninth unknown peer bypassed exhausted fallback after heartbeat")
+    H.SetFilter(nil)
+end)
+
+Scenario("online legacy donor version upgrade opens one recovery round without version-flap polling", function()
+    local gm, oldGateway, member, gateway, donor, t = GatewayHandoff(false, nil, true)
+    local requests = 0
+    H.SetFilter(function(packet, receiver)
+        local kind, fields = WireMessage(packet)
+        if receiver == gateway and packet.from == member and kind == "READY" then return false end
+        if packet.from == gateway and receiver == donor and kind == "TSYNC" and fields and fields[2] == donor.name then requests = requests + 1 end
+        return true
+    end)
+    donor.U.SayHello(); H.Step(205)
+    eq(gateway.U.Tickets()[t.id].state, "proposed", "legacy donor unexpectedly supported gateway attestation")
+    eq(requests, 0, "known legacy version consumed donor query slots")
+    local module = assert(loadfile((CZU_AUDIT_SOURCE_ROOT or os.getenv("CZU_AUDIT_SOURCE_ROOT") or "ChillZoneUnion/") .. "Transfers.lua"))
+    setfenv(module, donor.E); module("ChillZoneUnion", donor.U)
+    donor.U.VERSION = "0.9.3-beta"; donor.U.SayHello(); H.Step(35)
+    assert(donor.live and gateway.U.own[donor.name].online and requests > 0, "live version upgrade did not reopen recovery without offline gap")
+    eq(gateway.U.Tickets()[t.id].state, "ready", "upgraded online donor did not restore ready ticket")
+    local completed = requests
+    for i = 1, 3 do
+        donor.U.VERSION = "0.9.2-beta"; donor.U.SayHello(); H.Step(2)
+        donor.U.VERSION = "0.9.3-beta"; donor.U.SayHello(); H.Step(2)
+    end
+    H.Step(30)
+    eq(requests, completed, "version oscillation reopened a completed high-water recovery episode")
+    assert(not gateway.U.Tickets()[t.id].confirmedNonce, "version recovery created source ACK authority")
     H.SetFilter(nil)
 end)
 

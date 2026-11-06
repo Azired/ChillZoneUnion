@@ -6,6 +6,7 @@ local syncRequest, syncReplies, syncReplyAt, syncProgress, syncPushState = nil, 
 local gatewayRecovery
 local syncWindow, syncCount, syncBytes = -100, 0, 0
 local SYNC_REPLY_FOR, SYNC_REPLY_LIMIT, SYNC_REPLY_BYTES = 15, 8, 4096
+local RECOVERY_UNKNOWN_LIMIT = 8
 function U.Tickets()
     U.db.tickets = U.db.tickets or {}
     return U.db.tickets
@@ -79,6 +80,21 @@ local function RecoveryPeer(name)
     local row = U.own[name]
     return name ~= U.me and row and row.online and LiveAddonMember(name) and U.CanRelay(name) or false
 end
+-- Version is only a scheduling hint. Relay authority and nonce checks remain
+-- mandatory even when a client advertises support for reverse recovery.
+local function RecoveryCapability(name)
+    local info = U.AddonInfo and U.AddonInfo(name, U.guild)
+    if not info or not info.known or not info.live or not U.Text(info.version, 40) then return 0 end
+    local major, minor, patch, suffix = info.version:match("^(%d+)%.(%d+)%.(%d+)(.*)$")
+    if not major or suffix ~= "" and not suffix:match("^[%.%-][A-Za-z0-9%.%-]+$") then return 0 end
+    major, minor, patch = tonumber(major), tonumber(minor), tonumber(patch)
+    if major > 0 or minor > 9 or minor == 9 and patch >= 3 then return 1 end
+    return -1
+end
+local function RecoveryCandidate(recovery, name, capability)
+    return capability >= 0 and not recovery.finished[name]
+        and (capability > 0 or recovery.unknownPeers[name] or recovery.unknownUsed < RECOVERY_UNKNOWN_LIMIT)
+end
 local function ReplyAllowed(name, donor)
     -- A backup relay can attest only to the current gateway that requested it.
     if donor then return U.CanRelay() and name == U.GatewayName() and RecoveryPeer(name) end
@@ -142,18 +158,26 @@ function U.TransferSyncRequest(force, peer)
         if not force and gatewayRecovery and gatewayRecovery.guild == U.guild then
             if peer and RecoveryPeer(peer) then
                 local helloAt, previous = U.peers[peer].at, gatewayRecovery.seen[peer]
+                local capability = RecoveryCapability(peer)
+                local upgraded = capability > 0 and not gatewayRecovery.supported[peer]
+                if capability > 0 then gatewayRecovery.supported[peer] = true end
                 gatewayRecovery.seen[peer] = helloAt
-                if not previous or helloAt - previous > 65 then
+                if capability >= 0 and (not previous or helloAt - previous > 65 or upgraded) then
                     gatewayRecovery.peers[peer] = nil
                     gatewayRecovery.finished[peer] = nil
                     if gatewayRecovery.active == peer then gatewayRecovery.active = nil end
                     gatewayRecovery.untilAt = now + CONFIRM_FOR
+                    gatewayRecovery.dormant = nil
                 end
             end
             return true
         end
-        gatewayRecovery = { guild = U.guild, untilAt = now + CONFIRM_FOR, nextAt = now, peers = {}, seen = {}, finished = {} }
-        for name, info in pairs(U.peers) do if RecoveryPeer(name) then gatewayRecovery.seen[name] = info.at end end
+        gatewayRecovery = { guild = U.guild, untilAt = now + CONFIRM_FOR, nextAt = now, peers = {}, seen = {},
+            finished = {}, supported = {}, unknownPeers = {}, unknownUsed = 0 }
+        for name, info in pairs(U.peers) do if RecoveryPeer(name) then
+            gatewayRecovery.seen[name] = info.at
+            if RecoveryCapability(name) > 0 then gatewayRecovery.supported[name] = true end
+        end end
         return true
     end
     gatewayRecovery = nil
@@ -211,40 +235,56 @@ local function RecoveryTick(now)
     if recovery.guild ~= U.guild or not OwnGateway() then gatewayRecovery = nil; return end
     if now >= (recovery.cleanAt or 0) then
         for name in pairs(recovery.seen) do
-            if not U.own[name] then recovery.seen[name], recovery.finished[name], recovery.peers[name] = nil, nil, nil end
+            if not U.own[name] then
+                recovery.seen[name], recovery.finished[name], recovery.peers[name], recovery.supported[name] = nil, nil, nil, nil
+            end
         end
         recovery.cleanAt = now + SYNC_REPLY_FOR
     end
-    if now > recovery.untilAt then return end
+    if recovery.dormant then return end
     local active = recovery.active and recovery.peers[recovery.active]
-    if active and (active.complete or not RecoveryPeer(recovery.active) or now >= active.slotUntil) then
+    if active and (active.complete or not RecoveryPeer(recovery.active) or RecoveryCapability(recovery.active) < 0
+        or now >= active.untilAt or now >= active.slotUntil) then
         recovery.active, active = nil, nil
     end
     -- END closes one donor only. Another relay can retain a later READY or an
     -- entirely different ticket; an empty first reply cannot close the round.
     if not active then
-        local candidates, count = {}, 0
+        local candidates, capabilities, count = {}, {}, 0
         for name, peer in pairs(recovery.peers) do
-            if peer.complete then
+            if peer.complete or now >= peer.untilAt then
                 recovery.finished[name], recovery.peers[name] = true, nil
             elseif not RecoveryPeer(name) then recovery.peers[name] = nil
             else count = count + 1 end
         end
         for name in pairs(U.peers) do
             local peer = recovery.peers[name]
-            if RecoveryPeer(name) and not recovery.finished[name] and (peer and not peer.complete or not peer and count < 32) then
-                candidates[#candidates + 1] = name
+            if RecoveryPeer(name) then
+                local capability = RecoveryCapability(name)
+                if RecoveryCandidate(recovery, name, capability) and (peer and not peer.complete or not peer and count < 32) then
+                    capabilities[name], candidates[#candidates + 1] = capability, name
+                end
             end
         end
         table.sort(candidates, function(a, b)
+            if capabilities[a] ~= capabilities[b] then return capabilities[a] > capabilities[b] end
             local aa = recovery.peers[a] and recovery.peers[a].lastTry or -100
             local ba = recovery.peers[b] and recovery.peers[b].lastTry or -100
             if aa ~= ba then return aa < ba end
             return a < b
         end)
         local name = candidates[1]
-        if not name then return end
-        active = recovery.peers[name] or { nonce = U.NewID(), nextAt = now }
+        if not name then recovery.dormant = true; return end
+        active = recovery.peers[name]
+        if not active then
+            -- Every newly served donor gets a fixed full window. Later donors
+            -- can finish the finite pass without reopening timed-out peers.
+            active = { nonce = U.NewID(), nextAt = now, untilAt = now + CONFIRM_FOR }
+            recovery.untilAt = math.max(recovery.untilAt, active.untilAt)
+            if capabilities[name] == 0 and not recovery.unknownPeers[name] then
+                recovery.unknownPeers[name], recovery.unknownUsed = true, recovery.unknownUsed + 1
+            end
+        end
         active.lastTry, active.slotUntil = now, now + SYNC_REPLY_FOR
         recovery.peers[name], recovery.active = active, name
         recovery.seen[name] = U.peers[name].at
@@ -354,7 +394,7 @@ local function TakeState(f, sender, remote)
         request = recovery and recovery.peers[sender]
         if not OwnGateway() or not RecoveryPeer(sender) or not recovery or recovery.guild ~= U.guild
             or recovery.active ~= sender or not request or not ValidNonce(f[3]) or request.nonce ~= f[3]
-            or U.clock() > recovery.untilAt or U.clock() >= request.slotUntil then return false end
+            or U.clock() > recovery.untilAt or U.clock() >= request.untilAt or U.clock() >= request.slotUntil then return false end
     end
     if #f == 6 then
         if (f[4] ~= "END" and f[4] ~= "MORE") or not ValidNonce(f[5]) then return false end

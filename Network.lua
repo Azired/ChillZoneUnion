@@ -12,6 +12,7 @@ local everConnected, disconnectedAt, outageNotified, wasConnected = false, nil, 
 local OUTBOX_FOR, HISTORY_FOR, HISTORY_LIMIT = 30, 300, 100
 local outboxSequence, nativeReadyAt = 0, 0
 local QueueCross, RequestHistory, HistoryTick, BufferTick
+local selectedLink
 local function IsTextKind(kind)
     return kind == "CHAT" or kind == "NATIVE" or kind == "HREC" or kind == "ANNOUNCE" or kind == "ANNSTATE"
 end
@@ -280,6 +281,7 @@ function U.NetworkReset()
     wasConnected, disconnectedAt, outageNotified = false, nil, false
     U.peers, U.remote, U.linkState, U.gatewaySince = {}, nil, nil, nil
     U.links, U.inboundLinks, U.probes, U.pings = {}, {}, {}, {}
+    selectedLink = nil
     U.setup = { state = "idle", message = "Выберите офицера второй гильдии для первого подключения." }
     U.own = {}
     U.ClearQueue()
@@ -413,15 +415,40 @@ local function InboundLink(name)
         if U.Fold(canonical) == U.Fold(name) then return canonical, request end
     end
 end
-function U.PendingLink()
+function U.PendingLink(name, nonce)
     if not U.IsTrustOfficer() then return nil end
+    local function Card(canonical, request, expected)
+        if request and not request.approved and U.clock() <= request.untilAt
+            and (expected == nil or request.nonce == expected) then
+            return { name = canonical, guild = request.guild, nonce = request.nonce, untilAt = request.untilAt }
+        end
+    end
+    if name ~= nil or nonce ~= nil then
+        if not ValidNonce(nonce) then return nil end
+        local canonical, request = InboundLink(name)
+        return Card(canonical, request, nonce)
+    end
+    if selectedLink then
+        local canonical, request = InboundLink(selectedLink.name)
+        local current = Card(canonical, request, selectedLink.nonce)
+        if current then return current end
+        selectedLink = nil
+    end
     local chosen, request
     for name, pending in pairs(U.inboundLinks) do
         if not pending.approved and U.clock() <= pending.untilAt and (not request or pending.at < request.at or pending.at == request.at and name < chosen) then
             chosen, request = name, pending
         end
     end
-    if request then return { name = chosen, guild = request.guild, untilAt = request.untilAt } end
+    return Card(chosen, request)
+end
+function U.SelectPendingLink(name, nonce)
+    if not U.Name(name) or not ValidNonce(nonce) then return false end
+    local request = U.PendingLink(name, nonce)
+    if not request then return false end
+    selectedLink = { name = request.name, nonce = request.nonce }
+    if U.Refresh then U.Refresh() end
+    return true
 end
 function U.ConnectionView()
     local view = { connected = false, hasContacts = false, stage = "idle" }
@@ -475,18 +502,22 @@ function U.ConnectionView()
     end
     return view
 end
-function U.AcceptLink(name)
+function U.AcceptLink(name, nonce)
     local canonical, request = InboundLink(name)
-    if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt or U.ChatLocked() then return false end
+    if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt or U.ChatLocked()
+        or nonce ~= nil and request.nonce ~= nonce then return false end
+    if selectedLink and selectedLink.name == canonical and selectedLink.nonce == request.nonce then selectedLink = nil end
     request.approved, request.challenge, request.manual = true, U.NewID(), true
     request.untilAt = U.clock() + HANDSHAKE_TIMEOUT
     ReplyLink(canonical, "challenge", request.nonce, request.challenge)
     Setup("connecting", canonical, "Запрос подтверждён. Дождитесь завершения соединения; повторно вводить имя не нужно.")
     return true
 end
-function U.DeclineLink(name)
+function U.DeclineLink(name, nonce)
     local canonical, request = InboundLink(name)
-    if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt then return false end
+    if not U.IsTrustOfficer() or not request or request.approved or U.clock() > request.untilAt
+        or nonce ~= nil and request.nonce ~= nonce then return false end
+    if selectedLink and selectedLink.name == canonical and selectedLink.nonce == request.nonce then selectedLink = nil end
     U.inboundLinks[canonical] = nil
     ReplyLink(canonical, "error", request.nonce, "declined")
     Setup("declined", canonical, "Вы отклонили запрос. Для нового подключения договоритесь со вторым офицером и попросите его отправить запрос заново либо введите его полное имя.")

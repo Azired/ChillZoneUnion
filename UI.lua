@@ -911,11 +911,13 @@ function U.BuildLinkApprovalControls(parent)
     controls.decline = Button(parent, "Отклонить", 290, -339, 275)
     U.linkApprovalControls = controls
 end
-local function ActOnLinkRequest(name, guild, untilAt, accept)
+local function ActOnLinkRequest(name, guild, nonce, untilAt, accept)
     local request = U.PendingLink and U.PendingLink()
+    local exact = U.PendingLink and U.PendingLink(name, nonce)
     if U.IsTrustOfficer and U.IsTrustOfficer() and request and request.name == name
-        and request.guild == guild and request.untilAt == untilAt then
-        if accept then U.AcceptLink(name) else U.DeclineLink(name) end
+        and request.nonce == nonce and request.guild == guild and request.untilAt == untilAt
+        and exact and exact.name == name and exact.nonce == nonce then
+        if accept then U.AcceptLink(name, nonce) else U.DeclineLink(name, nonce) end
     end
     RenderLinks()
 end
@@ -940,12 +942,12 @@ local function RenderLinkApproval()
     Enable(controls.decline, request ~= nil)
     controls.accept:SetScript("OnClick", nil); controls.decline:SetScript("OnClick", nil)
     if request then
-        local name, guild, untilAt = request.name, request.guild, request.untilAt
+        local name, guild, nonce, untilAt = request.name, request.guild, request.nonce, request.untilAt
         controls.info:SetText("Запрос от: " .. U.SafeDisplay(name)
             .. "\nЗаявленная гильдия: " .. U.SafeDisplay(U.GUILDS[guild] or "неизвестна") .. " (не проверена)."
             .. "\nСверьте полное имя в Discord или лично. Разрешайте доступ только знакомому связному.")
-        controls.accept:SetScript("OnClick", function() ActOnLinkRequest(name, guild, untilAt, true) end)
-        controls.decline:SetScript("OnClick", function() ActOnLinkRequest(name, guild, untilAt, false) end)
+        controls.accept:SetScript("OnClick", function() ActOnLinkRequest(name, guild, nonce, untilAt, true) end)
+        controls.decline:SetScript("OnClick", function() ActOnLinkRequest(name, guild, nonce, untilAt, false) end)
     elseif officer then
         controls.info:SetText("Новых запросов подключения нет.\nПосле первой настройки главы, офицеры и ветераны поддерживают связь автоматически.")
     else
@@ -1441,12 +1443,30 @@ U.On("GUILD_ROSTER_UPDATE", function() U.MaybeShowSetup() end)
 U.On("PLAYER_GUILD_UPDATE", function() U.MaybeShowSetup() end)
 
 local connectionNotices, connectionNoticeWindow, connectionNoticeCount = {}, -100, 0
+local function ConnectionRequestLink(name, nonce)
+    local encoded = name:gsub(".", function(byte) return string.format("%02x", string.byte(byte)) end)
+    return "addon:ChillZoneUnion:connection:" .. encoded .. ":" .. nonce
+end
+local function OpenConnectionRequestLink(link)
+    if not U.Text(link, 430) then return false end
+    local encoded, nonce = link:match("^addon:ChillZoneUnion:connection:([0-9a-f]+):([%d%.]+)$")
+    if not encoded or #encoded > 320 or #encoded % 2 ~= 0 or #nonce > 40 then return false end
+    local name = encoded:gsub("..", function(byte) return string.char(tonumber(byte, 16)) end)
+    if U.Name(name) ~= name or not U.IsTrustOfficer or not U.IsTrustOfficer()
+        or not U.PendingLink or not U.SelectPendingLink then return false end
+    local request = U.PendingLink(name, nonce)
+    if not request or request.name ~= name or request.nonce ~= nonce then return false end
+    if not U.SelectPendingLink(name, nonce) then return false end
+    U.OpenSettings()
+    return true
+end
 function U.NotifyConnectionRequest(request)
     if type(request) ~= "table" or not U.IsTrustOfficer or not U.IsTrustOfficer() then return false end
     local name, now = U.Name(request.name), U.clock()
     local actual = name and U.inboundLinks and U.inboundLinks[name]
     if not actual or actual.approved or actual.nonce ~= request.nonce or actual.guild ~= request.guild
-        or actual.untilAt ~= request.untilAt or now > actual.untilAt then return false end
+        or actual.untilAt ~= request.untilAt or now > actual.untilAt
+        or not U.Text(actual.nonce, 40) or not actual.nonce:match("^[%d%.]+$") then return false end
     RefreshConnection()
     local key = name .. ":" .. tostring(actual.nonce)
     if connectionNotices[key] then return false end
@@ -1455,12 +1475,12 @@ function U.NotifyConnectionRequest(request)
     for previous, untilAt in pairs(connectionNotices) do if now > untilAt then connectionNotices[previous] = nil end end
     connectionNotices[key], connectionNoticeCount = actual.untilAt, connectionNoticeCount + 1
     U.Print("Запрос соединения от " .. U.SafeDisplay(name)
-        .. " — |cff71d5ff|Haddon:ChillZoneUnion:connection|h[Открыть]|h|r")
+        .. " — |cff71d5ff|H" .. ConnectionRequestLink(name, actual.nonce) .. "|h[Открыть]|h|r")
     return true
 end
 if hooksecurefunc and type(SetItemRef) == "function" then
     hooksecurefunc("SetItemRef", function(link)
-        if link == "addon:ChillZoneUnion:connection" and PendingRequest() then U.OpenSettings() end
+        OpenConnectionRequestLink(link)
     end)
 end
 

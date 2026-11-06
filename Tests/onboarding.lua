@@ -73,6 +73,34 @@ local function LogCount(c, needle)
     for _, line in ipairs(c.log) do if line:find(needle, 1, true) then n = n + 1 end end
     return n
 end
+local NOTICE_PREFIX = "addon:ChillZoneUnion:connection:"
+local function NoticeHref(c, sender)
+    local text = "Запрос соединения от " .. c.U.SafeDisplay(sender.name) .. " — "
+    for i = #c.log, 1, -1 do
+        local line = c.log[i]
+        if line:find(text, 1, true) then return assert(line:match("|H([^|]+)|h"), "request notice has no hyperlink") end
+    end
+    error("request notice missing for " .. sender.name)
+end
+local function HexName(name)
+    return (name:gsub(".", function(byte) return string.format("%02x", byte:byte()) end))
+end
+local function OpenNotice(c, sender)
+    c.E.SetItemRef(NoticeHref(c, sender), "[Открыть]", "LeftButton")
+end
+local function AssertSelected(c, sender, nonce)
+    local selected = assert(c.U.PendingLink(), "selected request missing")
+    eq(selected.name, sender.name, "wrong request is selected")
+    if nonce then eq(selected.nonce, nonce, "selected request nonce changed") end
+    local view = c.U.ConnectionView()
+    eq(view.pendingName, sender.name, "heading describes another request")
+    local controls = assert(c.U.linkApprovalControls, "approval controls missing")
+    assert(controls.info:GetText():find(c.U.SafeDisplay(sender.name), 1, true), "approval card describes another sender")
+    assert(Window(c).czuSetupProgress:GetText():find(c.U.SafeDisplay(sender.name), 1, true),
+        "connection status above the card describes another sender")
+    assert(controls.accept:IsEnabled() and controls.decline:IsEnabled(), "selected request actions are unavailable")
+    assert(not c.U.TrustedPeer(sender.name), "opening a notice approved its sender")
+end
 local function VisibleText(c, needle)
     for _, frame in ipairs(c.allFrames) do
         if H.FrameVisible(frame) then
@@ -103,7 +131,7 @@ Scenario("closed-window incoming request is visible and remains untrusted", func
     eq(view.stage, "pending", "pending view stage")
     eq(view.pendingName, sender.name, "pending view identity")
     assert(view.heading:find("подтверж", 1, true), "header does not call for manual confirmation")
-    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection|h"), 1, "incoming request notice count")
+    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection:"), 1, "incoming request notice count")
     assert(PendingMark(c), "closed window has no temporary minimap marker")
     AssertNoExternalTrust(c, sender)
     assert(not Window(c) or not Window(c):IsShown(), "incoming stranger forced a modal window")
@@ -112,10 +140,10 @@ end)
 Scenario("retrying the same request does not spam notices or grant approval", function()
     local c, sender = World()
     RawLink(c, sender, "1234.2")
-    local n = LogCount(c, "|Haddon:ChillZoneUnion:connection|h")
+    local n = LogCount(c, "|Haddon:ChillZoneUnion:connection:")
     for _ = 1, 6 do H.Advance(1); RawLink(c, sender, "1234.2") end
     eq(n, 1, "initial notice not emitted")
-    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection|h"), n, "transport retries produced repeated notices")
+    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection:"), n, "transport retries produced repeated notices")
     AssertNoExternalTrust(c, sender)
 end)
 
@@ -127,9 +155,8 @@ Scenario("notice hyperlink opens approval without accepting it", function()
         eq(c.lastItemRef, link, "connection hook replaced the native item-ref dispatcher")
         assert(not Window(c) or not Window(c):IsShown(), "ordinary native link opened connection setup")
     end
-    local href
-    for _, line in ipairs(c.log) do if line:find("Запрос соединения", 1, true) then href = line:match("|H([^|]+)|h") end end
-    eq(href, "addon:ChillZoneUnion:connection", "notice does not use a native registered hyperlink type")
+    local href = NoticeHref(c, sender)
+    eq(href, NOTICE_PREFIX .. HexName(sender.name) .. ":1234.3", "notice is not bound to the sender and request nonce")
     c.E.SetItemRef(href, "[Открыть]", "LeftButton")
     assert(IsPage(c, 4), "notice hyperlink did not open the connection tab")
     local controls = c.U.linkApprovalControls
@@ -138,10 +165,148 @@ Scenario("notice hyperlink opens approval without accepting it", function()
     AssertNoExternalTrust(c, sender)
 end)
 
+Scenario("clicking the second notice selects its card and affects only that request", function()
+    for _, action in ipairs({ "accept", "decline" }) do
+        local c, a = World(4, { officer = true })
+        RawLink(c, a, "8801.1"); H.Advance(1)
+        local b = { name = "Second Officer" }
+        RawLink(c, b, "8801.2")
+        c.U.OpenSettings()
+        eq(c.U.PendingLink().name, a.name, "fixture did not start at the older request")
+        OpenNotice(c, b)
+        AssertSelected(c, b, "8801.2")
+        Click(c.U.linkApprovalControls[action])
+        assert(c.U.inboundLinks[a.name] and not c.U.inboundLinks[a.name].approved,
+            "the second request action changed the older first request")
+        if action == "accept" then
+            assert(c.U.inboundLinks[b.name] and c.U.inboundLinks[b.name].approved,
+                "accept did not apply to the request named by the notice")
+        else assert(not c.U.inboundLinks[b.name], "decline did not remove the request named by the notice") end
+        AssertNoExternalTrust(c, a); AssertNoExternalTrust(c, b)
+    end
+end)
+
+Scenario("a declined request notice cannot fall back to another pending sender", function()
+    local c, a = World(4, { officer = true })
+    RawLink(c, a, "8802.1"); H.Advance(1)
+    local b = { name = "Second Officer" }
+    RawLink(c, b, "8802.2")
+    local stale = NoticeHref(c, b)
+    OpenNotice(c, b); AssertSelected(c, b, "8802.2")
+    Click(c.U.linkApprovalControls.decline)
+    eq(c.U.PendingLink().name, a.name, "remaining first request disappeared")
+    Window(c):Hide()
+    c.E.SetItemRef(stale, "[Старое уведомление]", "LeftButton")
+    assert(not Window(c):IsShown(), "stale second notice opened another sender's request")
+    eq(c.U.PendingLink().name, a.name, "stale notice selected a different request")
+    assert(not c.U.inboundLinks[a.name].approved, "stale notice approved the remaining request")
+end)
+
+Scenario("an expired notice cannot open a newer still-pending request", function()
+    local c = World(4, { officer = true })
+    local b, a = { name = "Expired Officer" }, { name = "Current Officer" }
+    RawLink(c, b, "8803.1")
+    local stale = NoticeHref(c, b)
+    H.Advance(2); RawLink(c, a, "8803.2")
+    c.U.OpenSettings(); Window(c):Hide()
+    H.Advance(179.5); H.SetRosters(0); c.U.NetworkTick(); c.U.Refresh()
+    assert(not c.U.inboundLinks[b.name] and c.U.PendingLink().name == a.name,
+        "fixture did not preserve only the newer pending request")
+    c.E.SetItemRef(stale, "[Старое уведомление]", "LeftButton")
+    assert(not Window(c):IsShown(), "expired notice fell back to the current pending request")
+    eq(c.U.PendingLink().name, a.name, "expired notice changed the current request")
+end)
+
+Scenario("a renewed sender nonce rejects the old notice and saved action closures", function()
+    local c, a = World(4, { officer = true })
+    RawLink(c, a, "8804.1"); H.Advance(1)
+    local b = { name = "Renewed Officer" }
+    RawLink(c, b, "8804.2"); OpenNotice(c, b)
+    local oldHref = NoticeHref(c, b)
+    local oldAccept = c.U.linkApprovalControls.accept.scripts.OnClick
+    local oldDecline = c.U.linkApprovalControls.decline.scripts.OnClick
+    H.Advance(1); RawLink(c, b, "8804.3")
+    Window(c):Hide()
+    c.E.SetItemRef(oldHref, "[Старое уведомление]", "LeftButton")
+    assert(not Window(c):IsShown(), "old nonce reopened the sender's renewed request")
+    assert(not c.U.SelectPendingLink(b.name, "8804.2"), "exact selector admitted an old request nonce")
+    assert(not c.U.AcceptLink(b.name, "8804.2") and not c.U.DeclineLink(b.name, "8804.2"),
+        "old action nonce changed a renewed request")
+    OpenNotice(c, b); AssertSelected(c, b, "8804.3")
+    oldAccept(); oldDecline()
+    assert(c.U.inboundLinks[b.name] and not c.U.inboundLinks[b.name].approved
+        and c.U.inboundLinks[b.name].nonce == "8804.3", "saved old action closure modified the renewed request")
+    AssertSelected(c, b, "8804.3")
+    Click(c.U.linkApprovalControls.decline)
+    assert(not c.U.inboundLinks[b.name] and c.U.inboundLinks[a.name] and not c.U.inboundLinks[a.name].approved,
+        "current nonce action did not stay within the selected request")
+end)
+
+Scenario("saved actions for an unselected request cannot act on either sender", function()
+    local c, a = World(4, { officer = true })
+    RawLink(c, a, "8805.1"); H.Advance(1)
+    local b = { name = "Second Officer" }
+    RawLink(c, b, "8805.2"); OpenNotice(c, b)
+    local oldAccept = c.U.linkApprovalControls.accept.scripts.OnClick
+    local oldDecline = c.U.linkApprovalControls.decline.scripts.OnClick
+    OpenNotice(c, a); AssertSelected(c, a, "8805.1")
+    oldAccept(); oldDecline()
+    assert(c.U.inboundLinks[a.name] and not c.U.inboundLinks[a.name].approved
+        and c.U.inboundLinks[b.name] and not c.U.inboundLinks[b.name].approved,
+        "saved request action changed one of the pending senders after selection changed")
+    AssertSelected(c, a, "8805.1")
+end)
+
+Scenario("malformed and unrelated native addon links leave the selected request alone", function()
+    local c, a = World(4, { officer = true })
+    RawLink(c, a, "8806.1"); H.Advance(1)
+    local b = { name = "Second Officer" }
+    RawLink(c, b, "8806.2"); OpenNotice(c, b); Window(c):Hide()
+    local valid = NoticeHref(c, b)
+    local links = {
+        "addon:ChillZoneUnion:connection", NOTICE_PREFIX, NOTICE_PREFIX .. "0:8806.2",
+        NOTICE_PREFIX .. "gg:8806.2", NOTICE_PREFIX .. ":8806.2",
+        NOTICE_PREFIX .. HexName(b.name):upper() .. ":8806.2",
+        NOTICE_PREFIX .. HexName(" " .. b.name) .. ":8806.2",
+        NOTICE_PREFIX .. HexName(b.name .. " ") .. ":8806.2",
+        NOTICE_PREFIX .. "00:8806.2", NOTICE_PREFIX .. "0a:8806.2",
+        NOTICE_PREFIX .. string.rep("61", 161) .. ":8806.2",
+        NOTICE_PREFIX .. HexName(b.name) .. ":", NOTICE_PREFIX .. HexName(b.name) .. ":nonnonce",
+        NOTICE_PREFIX .. HexName(b.name) .. ":" .. string.rep("1", 41),
+        NOTICE_PREFIX .. HexName(b.name) .. ":8806.99", NOTICE_PREFIX .. HexName("Unknown Officer") .. ":8806.2",
+        valid .. ":trailing", "addon:AnotherAddon:connection", "addon:ChillZoneUnion:other:payload",
+    }
+    for _, link in ipairs(links) do
+        c.E.SetItemRef(link, "[Неизвестная ссылка]", "LeftButton")
+        eq(c.lastItemRef, link, "connection hook replaced native addon-link dispatch")
+        assert(not Window(c):IsShown(), "malformed or unrelated link opened an approval card")
+        eq(c.U.PendingLink().name, b.name, "malformed link fell back to the older request")
+    end
+    assert(not c.U.SelectPendingLink(nil, nil), "nil selector fell back to the oldest request")
+    assert(not c.U.SelectPendingLink(a.name, nil), "selector without nonce changed the current request")
+    assert(not c.U.PendingLink(a.name, "8806.99"), "exact query with unknown nonce returned another request")
+    eq(c.U.PendingLink().name, b.name, "failed exact selection changed the current request")
+    AssertNoExternalTrust(c, a); AssertNoExternalTrust(c, b)
+end)
+
+Scenario("bound notices round-trip Cyrillic spaces and accepted special name bytes", function()
+    for i, name in ipairs({ "Вован Дубан", "Officer O'Brien", "Тест :50% ~Ю", string.rep("Ж", 65) .. " Отдел" }) do
+        local c = World(4, { officer = true })
+        local sender, nonce = { name = name }, "8807." .. i
+        eq(c.U.Name(name), name, "name fixture is not canonical")
+        RawLink(c, sender, nonce)
+        eq(NoticeHref(c, sender), NOTICE_PREFIX .. HexName(name) .. ":" .. nonce,
+            "notice changed name bytes or omitted its nonce")
+        OpenNotice(c, sender); AssertSelected(c, sender, nonce)
+        Click(c.U.linkApprovalControls.decline)
+        assert(not c.U.inboundLinks[name], "decoded request action did not match the original name bytes")
+    end
+end)
+
 Scenario("many unsolicited endpoints cannot flood chat or create trust", function()
     local c = World(4, { officer = true })
     for i = 1, 12 do RawLink(c, { name = "Stranger Officer" .. i }, "4200." .. i) end
-    local notices = LogCount(c, "|Haddon:ChillZoneUnion:connection|h")
+    local notices = LogCount(c, "|Haddon:ChillZoneUnion:connection:")
     assert(notices > 0 and notices <= 8, "unsolicited endpoints exhausted the chat with request notices")
     assert(PendingMark(c) and c.U.PendingLink(), "rate-limited notices hid the remaining manual action")
     assert(not next(c.U.db.contacts), "notification flood inserted trusted endpoints")
@@ -184,19 +349,20 @@ Scenario("declining updates the view and a later request can be noticed", functi
     assert(not c.U.linkApprovalControls.accept:IsEnabled(), "declined request can still be accepted")
     H.Advance(12); RawLink(c, sender, "1234.5")
     eq(c.U.ConnectionView().stage, "pending", "new request did not replace declined state")
-    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection|h"), 2, "new intentional request not notified")
+    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection:"), 2, "new intentional request not notified")
 end)
 
 Scenario("expired incoming request removes stale confirmation and stale links do nothing", function()
     local c, sender = World()
     RawLink(c, sender, "1234.6")
+    local href = NoticeHref(c, sender)
     c.U.OpenSettings()
     H.Advance(181); H.SetRosters(0); c.U.NetworkTick(); c.U.Refresh()
     assert(not c.U.PendingLink(), "expired request retained")
     eq(c.U.ConnectionView().stage, "expired", "expired view retained approval instructions")
     assert(not PendingMark(c) and not c.U.linkApprovalControls.accept:IsEnabled(), "expired request still actionable")
     Window(c):Hide()
-    c.E.SetItemRef("addon:ChillZoneUnion:connection", "[Открыть]", "LeftButton")
+    c.E.SetItemRef(href, "[Открыть]", "LeftButton")
     assert(not Window(c):IsShown(), "stale notice reopened an expired request")
     AssertNoExternalTrust(c, sender)
 end)
@@ -248,6 +414,7 @@ end)
 Scenario("native authority revocation hides confirmation and disables old notice", function()
     local c, sender = World(4, { officer = true })
     RawLink(c, sender, "1234.7")
+    local href = NoticeHref(c, sender)
     c.U.OpenSettings()
     local oldAction = c.U.linkApprovalControls.accept.scripts.OnClick
     c.officer = false; H.SetRosters(0); Event(c, "GUILD_RANKS_UPDATE"); c.U.Refresh()
@@ -257,7 +424,7 @@ Scenario("native authority revocation hides confirmation and disables old notice
     if oldAction then oldAction() end
     AssertNoExternalTrust(c, sender)
     Window(c):Hide()
-    c.E.SetItemRef("addon:ChillZoneUnion:connection", "[Открыть]", "LeftButton")
+    c.E.SetItemRef(href, "[Открыть]", "LeftButton")
     assert(not Window(c):IsShown(), "old notification bypassed revoked native authority")
 end)
 
@@ -266,7 +433,7 @@ Scenario("veteran can relay configured data but cannot confirm initial stranger"
     RawLink(c, sender, "1234.8")
     assert(c.U.CanRelay() and not c.U.IsTrustOfficer(), "veteran fixture authority mismatch")
     assert(not c.U.PendingLink() and not PendingMark(c), "veteran offered initial stranger approval")
-    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection|h"), 0, "veteran received officer approval notice")
+    eq(LogCount(c, "|Haddon:ChillZoneUnion:connection:"), 0, "veteran received officer approval notice")
     AssertNoExternalTrust(c, sender)
 end)
 
