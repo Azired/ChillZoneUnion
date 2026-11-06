@@ -1,0 +1,47 @@
+CURSEFORGE PROJECT FIELDS
+
+Project name: ChillZoneUnion
+Summary: Shared chat, roster and class statistics for the ChillZone and ChillZone Forever guilds in WoW Forever, with automatic relays and voluntary guild transfers.
+Game: World of Warcraft
+Game flavor: WoW Forever
+Game version: 1.60.1
+Primary category: Guild
+Additional category: Chat & Communication
+License: MIT License
+Source: https://github.com/Azired/ChillZoneUnion
+Issues: https://github.com/Azired/ChillZoneUnion/issues
+Experimental: Off
+
+Project description: copy description.md (English first, Russian below).
+Logo: upload logo.png (square PNG, at least 400 x 400 pixels).
+
+FILE FIELDS FOR THE FIRST UPLOAD
+
+File: ChillZoneUnion-0.6.2-beta.zip
+Display name: ChillZoneUnion 0.6.2-beta
+Release type: Beta
+Game flavor: WoW Forever
+Game version: 1.60.1
+Changelog: copy changelog.md.
+Dependencies: none; LibStub and the modified LibDeflate are included.
+
+ПРИМЕЧАНИЯ
+
+На странице проекта название, Summary и описание должны содержать
+английский текст. Готовое описание уже включает русский раздел ниже.
+Русский язык игрового интерфейса указан в описании.
+
+Не добавляйте внешнюю ссылку прямого скачивания ZIP в описание проекта.
+Для исходников и ошибок используйте отдельные поля Source и Issues.
+
+Не выбирайте Retail, Classic Era или другую неподтверждённую версию.
+Если WoW Forever или 1.60.1 недоступны в форме, остановите отправку
+и уточните подходящий вариант у поддержки CurseForge.
+
+Файл остаётся Beta. Проект только с бета-файлами доступен на сайте,
+но для появления в приложении CurseForge нужен хотя бы один настоящий
+файл типа Release и выключенный Experimental. Не меняйте тип на Release
+только ради видимости: сначала проверьте работу двух настоящих клиентов.
+
+Лицензия исходников аддона — MIT. Вложенные библиотеки сохраняют свои
+уведомления: LibStub — public domain, LibDeflate — zlib с пометкой изменений.

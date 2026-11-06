@@ -29,13 +29,10 @@ $manifest = @(
     'Media/arrow-right.tga',
     'Media/arrow-up.tga',
     'Media/minimap.tga',
-    'Media/status-dot.tga',
-    'Tests/run-lua.ps1',
-    'Tests/security.lua',
-    'Tests/simulation.lua'
+    'Media/status-dot.tga'
 )
-if ($manifest.Count -ne 26 -or @($manifest | Select-Object -Unique).Count -ne 26) {
-    throw 'The addon package manifest must contain exactly 26 distinct files.'
+if ($manifest.Count -ne 23 -or @($manifest | Select-Object -Unique).Count -ne 23) {
+    throw 'The addon package manifest must contain exactly 23 distinct files.'
 }
 
 foreach ($relative in $manifest) {
@@ -77,7 +74,7 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
 }
 if ($ValidateOnly) {
-    Write-Output "Validated ChillZoneUnion ${version}: 26 addon files."
+    Write-Output "Validated ChillZoneUnion ${version}: 23 addon files (developer tests excluded)."
     return
 }
 
@@ -105,7 +102,7 @@ try {
 $check = [IO.Compression.ZipFile]::OpenRead($archive)
 $hasher = [Security.Cryptography.SHA256]::Create()
 try {
-    if ($check.Entries.Count -ne 26) { throw 'The finished ZIP does not contain exactly 26 files.' }
+    if ($check.Entries.Count -ne 23) { throw 'The finished ZIP does not contain exactly 23 files.' }
     foreach ($relative in $manifest) {
         $entry = $check.GetEntry("ChillZoneUnion/$relative")
         if ($null -eq $entry) { throw "The finished ZIP is missing: $relative" }
@@ -121,4 +118,4 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "archive=$archive" -Encoding utf8
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha256=$sha256" -Encoding utf8
 }
-[pscustomobject]@{ Version = $version; Tag = $tag; Archive = $archive; SHA256 = $sha256; FileCount = 26 }
+[pscustomobject]@{ Version = $version; Tag = $tag; Archive = $archive; SHA256 = $sha256; FileCount = 23 }

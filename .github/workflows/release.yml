@@ -50,7 +50,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Build and verify the 26-file addon ZIP
+      - name: Build and verify the 23-file addon ZIP without developer tests
         id: package
         shell: pwsh
         run: ./tools/package.ps1
