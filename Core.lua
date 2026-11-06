@@ -1,6 +1,6 @@
 local _, U = ...
 ChillZoneUnion = U
-U.VERSION, U.PREFIX = "0.6.0-beta", "CZUnion3"
+U.VERSION, U.PREFIX = "0.6.1-beta", "CZUnion3"
 U.GUILDS = { "Чиллзон", "Чиллзон Навсегда" }
 U.GUILD_LEADERS = { [1] = "Вован Дубан" }
 U.UNION_LEADER = "Вован Дубан"
@@ -211,6 +211,7 @@ function U.Command(input)
     elseif cmd == "help" then
         U.Print("/cz accept Полное Имя; /cz decline Полное Имя — первое соединение настраивают главы и офицеры. Связные: главы, офицеры и ветераны.")
         U.Print("/cz — окно; /czu текст — общий чат; /cz link Имя Фамилия — связать гильдии; /cz sync; /cz status; /cz guildchat on|off.")
+        U.Print("/чз — синоним /cz; /cz текст и /чз текст — общий чат.")
     else U.SendChat(input) end
 end
 
@@ -254,6 +255,7 @@ f:SetScript("OnEvent", function(_, event, ...)
         U.UpdateIdentity()
         C_ChatInfo.RegisterAddonMessagePrefix(U.PREFIX)
         SLASH_CHILLZONEUNION1, SLASH_CHILLZONEUNION2 = "/cz", "/чиллзон"
+        SLASH_CHILLZONEUNION3 = "/чз"
         SlashCmdList.CHILLZONEUNION = U.Command
         SLASH_CHILLZONECHAT1 = "/czu"
         SlashCmdList.CHILLZONECHAT = function(s) U.SendChat(s) end
